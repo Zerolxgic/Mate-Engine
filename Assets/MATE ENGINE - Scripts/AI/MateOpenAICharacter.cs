@@ -8,6 +8,7 @@ using UnityEngine.Networking;
 
 /// <summary>
 /// Mate-owned OpenAI-compatible chat backend that ChatBot can use via LLMCharacter polymorphism.
+/// Routes assistant text through MateConversationTurn + segment foundation (Slice 4).
 /// Does not initialize or register with the bundled llama.cpp LLM path.
 /// </summary>
 [DefaultExecutionOrder(-1)]
@@ -23,6 +24,9 @@ public class MateOpenAICharacter : LLMCharacter
 
     MateOpenAIConfig config;
     UnityWebRequest activeRequest;
+    MateConversationTurn activeTurn;
+
+    public MateConversationTurn ActiveTurn => activeTurn;
 
     public void Configure(MateOpenAIConfig cfg)
     {
@@ -85,7 +89,6 @@ public class MateOpenAICharacter : LLMCharacter
 
     void Start()
     {
-        // Mirror Mate's existing prompt file behavior without relying on LLMCharacter's private Start.
         try
         {
             string promptPath = System.IO.Path.Combine(Application.persistentDataPath, "ZomeAI_prompt.txt");
@@ -179,21 +182,46 @@ public class MateOpenAICharacter : LLMCharacter
             return null;
         }
 
+        // Single-active-turn: deterministically cancel any in-flight turn before starting another.
+        if (activeTurn != null && activeTurn.State == MateConversationTurn.TurnState.Running)
+        {
+            Debug.LogWarning($"{LogPrefix} Chat() called while turn {activeTurn.TurnId} is Running — cancelling prior turn.");
+            CancelActiveTurnLocal();
+        }
+
         if (chat == null || chat.Count == 0)
             ClearChat();
 
-        // Build request messages from current history + this user turn (without mutating yet).
+        var turn = new MateConversationTurn();
+        turn.Start();
+        activeTurn = turn;
+
         var messages = new List<ChatMessage>(chat);
         messages.Add(new ChatMessage { role = NormalizeRole(playerName), content = query });
 
         string reply = null;
         try
         {
-            reply = await PostChatCompletions(messages);
-            if (string.IsNullOrEmpty(reply))
-                reply = "(local backend returned empty content)";
+            string providerText = await PostChatCompletions(messages, turn.TurnId);
 
-            if (addToHistory)
+            if (!IsCurrentTurn(turn.TurnId) || turn.State != MateConversationTurn.TurnState.Running)
+            {
+                // Cancelled or superseded — do not mutate history or UI with late success.
+                reply = turn.GetRawResponseText();
+                completionCallback?.Invoke();
+                return reply;
+            }
+
+            if (string.IsNullOrEmpty(providerText))
+                providerText = "(local backend returned empty content)";
+
+            // Slice 4: feed complete non-streaming text as one synthetic chunk through the turn segmenter.
+            turn.AppendAssistantChunk(providerText);
+            turn.Complete();
+
+            reply = turn.GetRawResponseText();
+
+            if (addToHistory && IsCurrentTurn(turn.TurnId) && turn.State == MateConversationTurn.TurnState.Completed)
             {
                 await chatLock.WaitAsync();
                 try
@@ -207,15 +235,30 @@ public class MateOpenAICharacter : LLMCharacter
                 }
             }
 
-            callback?.Invoke(reply);
+            if (IsCurrentTurn(turn.TurnId) && turn.State == MateConversationTurn.TurnState.Completed)
+                callback?.Invoke(reply);
+        }
+        catch (OperationCanceledException)
+        {
+            reply = turn.GetRawResponseText();
+            // Cancellation is truthful; no assistant history append.
         }
         catch (Exception ex)
         {
-            string fail = "Local OpenAI backend failed: " + ex.Message;
-            Debug.LogError($"{LogPrefix} {fail}");
-            // Do not append failed turns to history.
-            callback?.Invoke(fail);
-            reply = fail;
+            if (IsCurrentTurn(turn.TurnId) && turn.State == MateConversationTurn.TurnState.Running)
+            {
+                turn.Fail(ex.Message);
+                string fail = "Local OpenAI backend failed: " + ex.Message;
+                Debug.LogError($"{LogPrefix} {fail}");
+                // Failed turns are not appended to conversation history.
+                callback?.Invoke(fail);
+                reply = fail;
+            }
+            else
+            {
+                reply = turn.GetRawResponseText();
+                Debug.Log($"{LogPrefix} Ignoring late provider error for terminal turn {turn.TurnId}: {ex.Message}");
+            }
         }
         finally
         {
@@ -227,6 +270,16 @@ public class MateOpenAICharacter : LLMCharacter
 
     public override void CancelRequests()
     {
+        CancelActiveTurnLocal();
+
+        try { base.CancelRequests(); } catch { }
+    }
+
+    void CancelActiveTurnLocal()
+    {
+        if (activeTurn != null && activeTurn.State == MateConversationTurn.TurnState.Running)
+            activeTurn.Cancel();
+
         try
         {
             if (activeRequest != null)
@@ -236,9 +289,11 @@ public class MateOpenAICharacter : LLMCharacter
             }
         }
         catch { }
+    }
 
-        // Also clear any leftover LLMUnity remote WIP list if base ever populated it.
-        try { base.CancelRequests(); } catch { }
+    bool IsCurrentTurn(Guid turnId)
+    {
+        return activeTurn != null && activeTurn.TurnId == turnId;
     }
 
     void OnDisable()
@@ -251,7 +306,7 @@ public class MateOpenAICharacter : LLMCharacter
         CancelRequests();
     }
 
-    async Task<string> PostChatCompletions(List<ChatMessage> messages)
+    async Task<string> PostChatCompletions(List<ChatMessage> messages, Guid turnId)
     {
         if (config == null) throw new InvalidOperationException("MateOpenAI config missing");
         if (string.IsNullOrWhiteSpace(config.model))
@@ -270,24 +325,39 @@ public class MateOpenAICharacter : LLMCharacter
                 req.SetRequestHeader("Authorization", "Bearer " + config.apiKey);
             req.timeout = Mathf.Clamp(config.timeoutSeconds, 5, 600);
 
+            if (!IsCurrentTurn(turnId) || activeTurn.State != MateConversationTurn.TurnState.Running)
+                throw new OperationCanceledException("Turn is not running");
+
             activeRequest = req;
             var op = req.SendWebRequest();
             while (!op.isDone)
                 await Task.Yield();
-            activeRequest = null;
+
+            if (activeRequest == req) activeRequest = null;
+
+            // Late / cancelled turn: do not parse into a newer turn's lifecycle.
+            if (!IsCurrentTurn(turnId) || activeTurn.State == MateConversationTurn.TurnState.Cancelled)
+                throw new OperationCanceledException("Turn cancelled");
 
             if (req.result != UnityWebRequest.Result.Success)
             {
+                if (activeTurn.State == MateConversationTurn.TurnState.Cancelled)
+                    throw new OperationCanceledException("Request aborted after cancel");
+
                 string errBody = req.downloadHandler?.text;
                 string snippet = string.IsNullOrEmpty(errBody) ? req.error :
                     (errBody.Length > 300 ? errBody.Substring(0, 300) + "..." : errBody);
                 throw new InvalidOperationException($"HTTP {(long)req.responseCode} from {url}: {snippet}");
             }
 
+            if (!IsCurrentTurn(turnId) || activeTurn.State != MateConversationTurn.TurnState.Running)
+                throw new OperationCanceledException("Turn no longer accepts provider content");
+
             string responseText = req.downloadHandler?.text ?? "";
             string content = ExtractAssistantContent(responseText);
             if (string.IsNullOrEmpty(content))
                 throw new InvalidOperationException("Response missing choices[0].message.content");
+            // Preserve Slice 3 extraction behavior (trim) as the accepted assistant text.
             return content.Trim();
         }
     }
@@ -297,7 +367,6 @@ public class MateOpenAICharacter : LLMCharacter
         if (string.IsNullOrWhiteSpace(role)) return "user";
         string r = role.Trim().ToLowerInvariant();
         if (r == "system" || r == "user" || r == "assistant") return r;
-        // Mate defaults playerName=user / AIName=assistant; map anything else conservatively.
         if (r == "player" || r == "human") return "user";
         if (r == "ai" || r == "bot") return "assistant";
         return role.Trim();
