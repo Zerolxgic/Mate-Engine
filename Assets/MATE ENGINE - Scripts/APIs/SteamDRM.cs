@@ -39,6 +39,10 @@ public static class SteamDRM
 
     public static bool TryInitLive(int appId, int ttlDays = 14)
     {
+#if UNITY_EDITOR
+        // Do not call SteamAPI.Init from the Editor — that registers Unity as Mate Engine.
+        return false;
+#else
         try
         {
             if (!Steamworks.SteamAPI.Init()) return false;
@@ -75,6 +79,7 @@ public static class SteamDRM
         {
             return false;
         }
+#endif
     }
 
     public static bool HasDLC(int dlcId)

@@ -79,6 +79,13 @@ public class SteamManager : MonoBehaviour {
 		// We want our SteamManager Instance to persist across scenes.
 		DontDestroyOnLoad(gameObject);
 
+#if UNITY_EDITOR
+		// Editor Play Mode must not relaunch the Steam-installed app, quit the Editor, or
+		// register the Editor process as the running Mate Engine Steam session.
+		m_bInitialized = false;
+		Debug.Log("[Steamworks.NET] Editor Play Mode: Steam API init/relaunch skipped (standalone Steam behavior unchanged).", this);
+		return;
+#else
 		if (!Packsize.Test()) {
 			Debug.LogError("[Steamworks.NET] Packsize Test returned false, the wrong version of Steamworks.NET is being run in this platform.", this);
 		}
@@ -127,6 +134,7 @@ public class SteamManager : MonoBehaviour {
 		}
 
 		s_EverInitialized = true;
+#endif
 	}
 
 	// This should only ever get called on first load and after an Assembly reload, You should never Disable the Steamworks Manager yourself.
