@@ -196,6 +196,8 @@ public class MateOpenAICharacter : LLMCharacter
         turn.Start();
         activeTurn = turn;
 
+        MateChatPresentationModel.Session.BeginUserTurn(turn.TurnId, query);
+
         var messages = new List<ChatMessage>(chat);
         messages.Add(new ChatMessage { role = NormalizeRole(playerName), content = query });
 
@@ -207,6 +209,7 @@ public class MateOpenAICharacter : LLMCharacter
             if (!IsCurrentTurn(turn.TurnId) || turn.State != MateConversationTurn.TurnState.Running)
             {
                 // Cancelled or superseded — do not mutate history or UI with late success.
+                MateChatPresentationModel.Session.CancelTurn(turn.TurnId);
                 reply = turn.GetRawResponseText();
                 completionCallback?.Invoke();
                 return reply;
@@ -220,6 +223,7 @@ public class MateOpenAICharacter : LLMCharacter
             turn.Complete();
 
             reply = turn.GetRawResponseText();
+            MateChatPresentationModel.Session.CompleteAssistant(turn);
 
             if (addToHistory && IsCurrentTurn(turn.TurnId) && turn.State == MateConversationTurn.TurnState.Completed)
             {
@@ -240,6 +244,7 @@ public class MateOpenAICharacter : LLMCharacter
         }
         catch (OperationCanceledException)
         {
+            MateChatPresentationModel.Session.CancelTurn(turn.TurnId);
             reply = turn.GetRawResponseText();
             // Cancellation is truthful; no assistant history append.
         }
@@ -248,6 +253,7 @@ public class MateOpenAICharacter : LLMCharacter
             if (IsCurrentTurn(turn.TurnId) && turn.State == MateConversationTurn.TurnState.Running)
             {
                 turn.Fail(ex.Message);
+                MateChatPresentationModel.Session.FailTurn(turn.TurnId, ex.Message);
                 string fail = "Local OpenAI backend failed: " + ex.Message;
                 Debug.LogError($"{LogPrefix} {fail}");
                 // Failed turns are not appended to conversation history.
@@ -256,6 +262,7 @@ public class MateOpenAICharacter : LLMCharacter
             }
             else
             {
+                MateChatPresentationModel.Session.CancelTurn(turn.TurnId);
                 reply = turn.GetRawResponseText();
                 Debug.Log($"{LogPrefix} Ignoring late provider error for terminal turn {turn.TurnId}: {ex.Message}");
             }
@@ -278,7 +285,11 @@ public class MateOpenAICharacter : LLMCharacter
     void CancelActiveTurnLocal()
     {
         if (activeTurn != null && activeTurn.State == MateConversationTurn.TurnState.Running)
+        {
+            var id = activeTurn.TurnId;
             activeTurn.Cancel();
+            MateChatPresentationModel.Session.CancelTurn(id);
+        }
 
         try
         {
@@ -313,7 +324,8 @@ public class MateOpenAICharacter : LLMCharacter
             throw new InvalidOperationException("MateOpenAIConfig.model is empty — set it to a local server model id");
 
         string url = config.ChatCompletionsUrl;
-        string json = BuildChatCompletionJson(config.model, messages, config.temperature, config.maxTokens);
+        int maxOutputTokens = config.GetRequestMaxTokens();
+        string json = BuildChatCompletionJson(config.model, messages, config.temperature, maxOutputTokens);
 
         byte[] body = Encoding.UTF8.GetBytes(json);
         using (var req = new UnityWebRequest(url, UnityWebRequest.kHttpVerbPOST))
@@ -354,10 +366,13 @@ public class MateOpenAICharacter : LLMCharacter
                 throw new OperationCanceledException("Turn no longer accepts provider content");
 
             string responseText = req.downloadHandler?.text ?? "";
-            string content = ExtractAssistantContent(responseText);
-            if (string.IsNullOrEmpty(content))
+            if (!TryParseChatCompletion(responseText, out string content, out string finishReason))
                 throw new InvalidOperationException("Response missing choices[0].message.content");
+
+            WarnIfOutputLengthLimited(finishReason, maxOutputTokens);
+
             // Preserve Slice 3 extraction behavior (trim) as the accepted assistant text.
+            // finish_reason=length still yields a successful Completed turn with preserved partial text.
             return content.Trim();
         }
     }
@@ -372,23 +387,32 @@ public class MateOpenAICharacter : LLMCharacter
         return role.Trim();
     }
 
-    static string BuildChatCompletionJson(string model, List<ChatMessage> messages, float temperature, int maxTokens)
+    /// <summary>
+    /// Build the non-streaming chat.completions request body.
+    /// <paramref name="maxOutputTokens"/> is max assistant completion size (provider max_tokens).
+    /// Exposed for deterministic output-budget verification.
+    /// </summary>
+    public static string BuildChatCompletionJson(string model, List<ChatMessage> messages, float temperature, int maxOutputTokens)
     {
-        var sb = new StringBuilder(256 + messages.Count * 64);
+        int tokens = MateOpenAIConfig.ResolveMaxOutputTokens(maxOutputTokens);
+        var sb = new StringBuilder(256 + (messages?.Count ?? 0) * 64);
         sb.Append('{');
-        sb.Append("\"model\":\"").Append(EscapeJson(model)).Append("\",");
+        sb.Append("\"model\":\"").Append(EscapeJson(model ?? "")).Append("\",");
         sb.Append("\"temperature\":").Append(temperature.ToString(System.Globalization.CultureInfo.InvariantCulture)).Append(',');
-        sb.Append("\"max_tokens\":").Append(maxTokens).Append(',');
+        sb.Append("\"max_tokens\":").Append(tokens).Append(',');
         sb.Append("\"stream\":false,");
         sb.Append("\"messages\":[");
-        for (int i = 0; i < messages.Count; i++)
+        if (messages != null)
         {
-            if (i > 0) sb.Append(',');
-            var m = messages[i];
-            sb.Append('{');
-            sb.Append("\"role\":\"").Append(EscapeJson(NormalizeRole(m.role))).Append("\",");
-            sb.Append("\"content\":\"").Append(EscapeJson(m.content ?? "")).Append('"');
-            sb.Append('}');
+            for (int i = 0; i < messages.Count; i++)
+            {
+                if (i > 0) sb.Append(',');
+                var m = messages[i];
+                sb.Append('{');
+                sb.Append("\"role\":\"").Append(EscapeJson(NormalizeRole(m.role))).Append("\",");
+                sb.Append("\"content\":\"").Append(EscapeJson(m.content ?? "")).Append('"');
+                sb.Append('}');
+            }
         }
         sb.Append("]}");
         return sb.ToString();
@@ -415,6 +439,7 @@ public class MateOpenAICharacter : LLMCharacter
     class OpenAIChoice
     {
         public OpenAIMessage message;
+        public string finish_reason;
     }
 
     [Serializable]
@@ -424,18 +449,42 @@ public class MateOpenAICharacter : LLMCharacter
         public string content;
     }
 
-    static string ExtractAssistantContent(string json)
+    /// <summary>
+    /// Parse OpenAI-compatible chat.completions JSON. Preserves partial content when
+    /// finish_reason is length (provider output-token cap). Test seam for O5.
+    /// </summary>
+    public static bool TryParseChatCompletion(string json, out string content, out string finishReason)
     {
-        if (string.IsNullOrWhiteSpace(json)) return null;
+        content = null;
+        finishReason = null;
+        if (string.IsNullOrWhiteSpace(json)) return false;
         try
         {
             var parsed = JsonUtility.FromJson<OpenAIChatResponse>(json);
-            if (parsed?.choices == null || parsed.choices.Length == 0) return null;
-            return parsed.choices[0]?.message?.content;
+            if (parsed?.choices == null || parsed.choices.Length == 0) return false;
+            var choice = parsed.choices[0];
+            content = choice?.message?.content;
+            finishReason = choice?.finish_reason;
+            return !string.IsNullOrEmpty(content);
         }
         catch
         {
-            return null;
+            return false;
         }
+    }
+
+    static string ExtractAssistantContent(string json)
+    {
+        return TryParseChatCompletion(json, out string content, out _) ? content : null;
+    }
+
+    /// <summary>Bounded diagnostic for finish_reason=length without failing the turn (O5 seam).</summary>
+    public static bool WarnIfOutputLengthLimited(string finishReason, int maxOutputTokens)
+    {
+        if (!string.Equals(finishReason, "length", StringComparison.OrdinalIgnoreCase))
+            return false;
+        Debug.LogWarning(
+            $"{LogPrefix} response reached provider output-token limit (max_tokens={maxOutputTokens})");
+        return true;
     }
 }
