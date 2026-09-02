@@ -62,6 +62,19 @@ public static class MateTechnicalChatVerify
             ("O3", CaseO3_InvalidOutputBudget),
             ("O4", CaseO4_StreamingUnchanged),
             ("O5", CaseO5_FinishReasonLength),
+            ("R1", CaseR1_RequestStreamingFlag),
+            ("R2", CaseR2_FragmentedSseFraming),
+            ("R3", CaseR3_MultipleEventsPerReceive),
+            ("R4", CaseR4_Utf8Fragmentation),
+            ("R5", CaseR5_ContentAccumulation),
+            ("R6", CaseR6_FencedCodeHostileBoundaries),
+            ("R7", CaseR7_ReasoningIsolation),
+            ("R8", CaseR8_IncrementalPresentation),
+            ("R9", CaseR9_NormalTerminalCompletion),
+            ("R10", CaseR10_LengthTerminalCompletion),
+            ("R11", CaseR11_CancellationMidstream),
+            ("R12", CaseR12_PrematureEofFailure),
+            ("R13", CaseR13_NonStreamingRegression),
         };
 
         var sb = new StringBuilder();
@@ -562,6 +575,252 @@ public static class MateTechnicalChatVerify
             throw new Exception("diagnostic path not taken");
         // Must not invent failure — content remains usable for Completed turn.
         if (string.IsNullOrEmpty(content)) throw new Exception("discarded");
+    }
+
+    static void CaseR1_RequestStreamingFlag()
+    {
+        string on = MateOpenAICharacter.BuildChatCompletionJson("m", null, 0.7f, 2048, stream: true);
+        if (!on.Contains("\"stream\":true")) throw new Exception("stream true missing: " + on);
+        string off = MateOpenAICharacter.BuildChatCompletionJson("m", null, 0.7f, 2048, stream: false);
+        if (!off.Contains("\"stream\":false")) throw new Exception("stream false missing: " + off);
+        var cfg = new MateOpenAIConfig();
+        if (!cfg.streamResponses) throw new Exception("default streamResponses should be true");
+    }
+
+    static void CaseR2_FragmentedSseFraming()
+    {
+        var parser = new MateOpenAISseParser();
+        var q = new System.Collections.Concurrent.ConcurrentQueue<MateOpenAISseEvent>();
+        string full = "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n";
+        // Split mid-payload across receives.
+        int mid = full.Length / 2;
+        parser.AppendText(full.Substring(0, mid), q);
+        if (!q.IsEmpty) throw new Exception("emitted early");
+        parser.AppendText(full.Substring(mid), q);
+        if (!q.TryDequeue(out var ev) || ev.Kind != MateOpenAISseEventKind.ContentDelta || ev.Text != "Hi")
+            throw new Exception("fragmented event");
+        if (q.TryDequeue(out _)) throw new Exception("extra event");
+    }
+
+    static void CaseR3_MultipleEventsPerReceive()
+    {
+        var parser = new MateOpenAISseParser();
+        var q = new System.Collections.Concurrent.ConcurrentQueue<MateOpenAISseEvent>();
+        string batch =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"A\"}}]}\n\n" +
+            "data: {\"choices\":[{\"delta\":{\"content\":\"B\"}}]}\n\n" +
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+            "data: [DONE]\n\n";
+        parser.AppendText(batch, q);
+        if (!q.TryDequeue(out var a) || a.Text != "A") throw new Exception("A");
+        if (!q.TryDequeue(out var b) || b.Text != "B") throw new Exception("B");
+        if (!q.TryDequeue(out var f) || f.Kind != MateOpenAISseEventKind.FinishReason || f.FinishReason != "stop")
+            throw new Exception("finish");
+        if (!q.TryDequeue(out var d) || d.Kind != MateOpenAISseEventKind.Done) throw new Exception("done");
+    }
+
+    static void CaseR4_Utf8Fragmentation()
+    {
+        var parser = new MateOpenAISseParser();
+        var q = new System.Collections.Concurrent.ConcurrentQueue<MateOpenAISseEvent>();
+        // € is UTF-8 E2 82 AC
+        byte[] euro = Encoding.UTF8.GetBytes("€");
+        string prefix = "data: {\"choices\":[{\"delta\":{\"content\":\"";
+        string suffix = "\"}}]}\n\n";
+        byte[] pre = Encoding.UTF8.GetBytes(prefix);
+        byte[] suf = Encoding.UTF8.GetBytes(suffix);
+        var first = new byte[pre.Length + 1];
+        Buffer.BlockCopy(pre, 0, first, 0, pre.Length);
+        first[pre.Length] = euro[0];
+        var second = new byte[2 + suf.Length];
+        second[0] = euro[1];
+        second[1] = euro[2];
+        Buffer.BlockCopy(suf, 0, second, 2, suf.Length);
+        parser.AppendBytes(first, first.Length, q);
+        if (!q.IsEmpty) throw new Exception("emitted before UTF-8 complete");
+        parser.AppendBytes(second, second.Length, q);
+        if (!q.TryDequeue(out var ev) || ev.Text != "€") throw new Exception("utf8=" + (ev.Text ?? "null"));
+    }
+
+    static void CaseR5_ContentAccumulation()
+    {
+        var turn = new MateConversationTurn();
+        turn.Start();
+        string[] parts = { "Hel", "lo", ", ", "world" };
+        foreach (var p in parts) turn.AppendAssistantChunk(p);
+        turn.Complete();
+        if (turn.GetRawResponseText() != "Hello, world") throw new Exception(turn.GetRawResponseText());
+    }
+
+    static void CaseR6_FencedCodeHostileBoundaries()
+    {
+        string[] deltas = { "`", "``py", "thon\npri", "nt('hi')\n`", "``" };
+        var streamed = new MateConversationTurn();
+        streamed.Start();
+        foreach (var d in deltas) streamed.AppendAssistantChunk(d);
+        streamed.Complete();
+
+        var full = new MateConversationTurn();
+        full.Start();
+        full.AppendAssistantChunk(string.Concat(deltas));
+        full.Complete();
+
+        var sSegs = streamed.GetSegmentsSnapshot();
+        var fSegs = full.GetSegmentsSnapshot();
+        if (sSegs.Count != fSegs.Count) throw new Exception("seg count " + sSegs.Count + " vs " + fSegs.Count);
+        for (int i = 0; i < sSegs.Count; i++)
+        {
+            if (sSegs[i].Kind != fSegs[i].Kind) throw new Exception("kind " + i);
+            if (sSegs[i].Text != fSegs[i].Text) throw new Exception("text " + i);
+            if (sSegs[i].Language != fSegs[i].Language) throw new Exception("lang " + i);
+        }
+        if (streamed.GetRawResponseText() != full.GetRawResponseText())
+            throw new Exception("raw mismatch");
+    }
+
+    static void CaseR7_ReasoningIsolation()
+    {
+        var turn = new MateConversationTurn();
+        turn.Start();
+        turn.AppendReasoningChunk("secret thoughts");
+        turn.AppendAssistantChunk("visible answer");
+        turn.Complete();
+        MateChatPresentationModel.Session.BeginUserTurn(turn.TurnId, "q");
+        MateChatPresentationModel.Session.CompleteAssistant(turn);
+        var snap = MateChatPresentationModel.Session.GetSnapshot();
+        var assistant = snap[1];
+        bool sawReasoning = false;
+        foreach (var s in assistant.Segments)
+        {
+            if (s.Kind == MateResponseSegmentKind.Reasoning)
+            {
+                sawReasoning = true;
+                if (s.SafeHtml != "" && s.SafeHtml.Contains("secret")) throw new Exception("reasoning html visible");
+            }
+        }
+        if (!sawReasoning) throw new Exception("reasoning segment missing");
+        if (turn.GetRawResponseText() != "visible answer") throw new Exception("history poisoned: " + turn.GetRawResponseText());
+        string json = MateChatPresentationModel.Session.ToJsonSnapshot();
+        // Detached page skips Reasoning kind; ensure prose is present.
+        if (!json.Contains("visible answer")) throw new Exception("prose missing");
+    }
+
+    static void CaseR8_IncrementalPresentation()
+    {
+        var turn = new MateConversationTurn();
+        turn.Start();
+        MateChatPresentationModel.Session.BeginUserTurn(turn.TurnId, "stream");
+        int r0 = MateChatPresentationModel.Session.Revision;
+        turn.AppendAssistantChunk("one ");
+        MateChatPresentationModel.Session.UpdateRunningAssistant(turn);
+        int r1 = MateChatPresentationModel.Session.Revision;
+        turn.AppendAssistantChunk("two");
+        MateChatPresentationModel.Session.UpdateRunningAssistant(turn);
+        int r2 = MateChatPresentationModel.Session.Revision;
+        if (r1 <= r0 || r2 <= r1) throw new Exception("revision not growing");
+        var snap = MateChatPresentationModel.Session.GetSnapshot();
+        int assistants = 0;
+        foreach (var e in snap)
+            if (e.Speaker == MateChatSpeaker.Assistant) assistants++;
+        if (assistants != 1) throw new Exception("dup rows " + assistants);
+        var a = snap[1];
+        if (a.State != MateChatEntryState.Running) throw new Exception("state");
+        if (a.PlainText != "one two") throw new Exception("plain=" + a.PlainText);
+    }
+
+    static void CaseR9_NormalTerminalCompletion()
+    {
+        var turn = new MateConversationTurn();
+        turn.Start();
+        MateChatPresentationModel.Session.BeginUserTurn(turn.TurnId, "q");
+        turn.AppendAssistantChunk("final");
+        MateChatPresentationModel.Session.UpdateRunningAssistant(turn);
+        // Simulate finish_reason stop + DONE (parser side already covered in R3).
+        turn.Complete();
+        MateChatPresentationModel.Session.CompleteAssistant(turn);
+        // Late complete ignored
+        MateChatPresentationModel.Session.CompleteAssistant(turn);
+        var snap = MateChatPresentationModel.Session.GetSnapshot();
+        if (snap[1].State != MateChatEntryState.Completed) throw new Exception("state");
+        if (snap[1].PlainText != "final") throw new Exception("text");
+        int assistants = 0;
+        foreach (var e in snap)
+            if (e.Speaker == MateChatSpeaker.Assistant) assistants++;
+        if (assistants != 1) throw new Exception("dup");
+    }
+
+    static void CaseR10_LengthTerminalCompletion()
+    {
+        var turn = new MateConversationTurn();
+        turn.Start();
+        MateChatPresentationModel.Session.BeginUserTurn(turn.TurnId, "q");
+        turn.AppendAssistantChunk("partial capped");
+        if (!MateOpenAICharacter.WarnIfOutputLengthLimited("length", 2048))
+            throw new Exception("diag");
+        turn.Complete();
+        MateChatPresentationModel.Session.CompleteAssistant(turn);
+        if (MateChatPresentationModel.Session.GetSnapshot()[1].PlainText != "partial capped")
+            throw new Exception("lost");
+    }
+
+    static void CaseR11_CancellationMidstream()
+    {
+        var turn = new MateConversationTurn();
+        turn.Start();
+        MateChatPresentationModel.Session.BeginUserTurn(turn.TurnId, "q");
+        turn.AppendAssistantChunk("partial visible");
+        MateChatPresentationModel.Session.UpdateRunningAssistant(turn);
+        turn.Cancel();
+        MateChatPresentationModel.Session.CancelTurn(turn.TurnId, turn);
+        // Late update/complete ignored
+        MateChatPresentationModel.Session.UpdateRunningAssistant(turn);
+        MateChatPresentationModel.Session.CompleteAssistant(turn);
+        var a = MateChatPresentationModel.Session.GetSnapshot()[1];
+        if (a.State != MateChatEntryState.Cancelled) throw new Exception("state");
+        if (!a.PlainText.Contains("partial")) throw new Exception("partial lost");
+
+        // Fresh turn can run
+        var t2 = new MateConversationTurn();
+        t2.Start();
+        MateChatPresentationModel.Session.BeginUserTurn(t2.TurnId, "next");
+        t2.AppendAssistantChunk("ok");
+        t2.Complete();
+        MateChatPresentationModel.Session.CompleteAssistant(t2);
+        if (MateChatPresentationModel.Session.GetSnapshot().Count != 4) throw new Exception("count");
+    }
+
+    static void CaseR12_PrematureEofFailure()
+    {
+        var turn = new MateConversationTurn();
+        turn.Start();
+        MateChatPresentationModel.Session.BeginUserTurn(turn.TurnId, "q");
+        turn.AppendAssistantChunk("partial before eof");
+        MateChatPresentationModel.Session.UpdateRunningAssistant(turn);
+        turn.Fail("streaming transport ended before terminal event");
+        MateChatPresentationModel.Session.FailTurn(turn.TurnId, "streaming transport ended before terminal event", turn);
+        var a = MateChatPresentationModel.Session.GetSnapshot()[1];
+        if (a.State != MateChatEntryState.Failed) throw new Exception("state");
+        if (!a.PlainText.Contains("partial")) throw new Exception("partial lost on fail");
+    }
+
+    static void CaseR13_NonStreamingRegression()
+    {
+        // Compatibility path still emits stream:false and honors output budget.
+        string json = MateOpenAICharacter.BuildChatCompletionJson("m", null, 0.1f, 2048, stream: false);
+        if (!json.Contains("\"stream\":false")) throw new Exception("stream");
+        if (!json.Contains("\"max_tokens\":2048")) throw new Exception("budget");
+        var cfg = new MateOpenAIConfig { streamResponses = false, maxTokens = 1024 };
+        if (cfg.streamResponses) throw new Exception("flag");
+        if (cfg.GetRequestMaxTokens() != 1024) throw new Exception("tokens");
+
+        var turn = new MateConversationTurn();
+        turn.Start();
+        MateChatPresentationModel.Session.BeginUserTurn(turn.TurnId, "buffered");
+        turn.AppendAssistantChunk("all at once");
+        turn.Complete();
+        MateChatPresentationModel.Session.CompleteAssistant(turn);
+        if (MateChatPresentationModel.Session.GetSnapshot()[1].PlainText != "all at once")
+            throw new Exception("transcript");
     }
 }
 #endif

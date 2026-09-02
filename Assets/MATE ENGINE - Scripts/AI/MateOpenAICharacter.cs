@@ -204,24 +204,48 @@ public class MateOpenAICharacter : LLMCharacter
         string reply = null;
         try
         {
-            string providerText = await PostChatCompletions(messages, turn.TurnId);
+            bool useStream = config.streamResponses;
+            string finishReason = null;
+
+            if (useStream)
+            {
+                finishReason = await StreamChatCompletions(messages, turn.TurnId);
+            }
+            else
+            {
+                var buffered = await PostChatCompletions(messages, turn.TurnId);
+                string providerText = buffered.content;
+                finishReason = buffered.finishReason ?? "stop";
+
+                if (!IsCurrentTurn(turn.TurnId) || turn.State != MateConversationTurn.TurnState.Running)
+                {
+                    MateChatPresentationModel.Session.CancelTurn(turn.TurnId, turn);
+                    reply = turn.GetRawResponseText();
+                    completionCallback?.Invoke();
+                    return reply;
+                }
+
+                if (string.IsNullOrEmpty(providerText))
+                    providerText = "(local backend returned empty content)";
+
+                turn.AppendAssistantChunk(providerText);
+            }
 
             if (!IsCurrentTurn(turn.TurnId) || turn.State != MateConversationTurn.TurnState.Running)
             {
                 // Cancelled or superseded — do not mutate history or UI with late success.
-                MateChatPresentationModel.Session.CancelTurn(turn.TurnId);
+                MateChatPresentationModel.Session.CancelTurn(turn.TurnId, turn);
                 reply = turn.GetRawResponseText();
                 completionCallback?.Invoke();
                 return reply;
             }
 
-            if (string.IsNullOrEmpty(providerText))
-                providerText = "(local backend returned empty content)";
+            if (string.IsNullOrEmpty(turn.GetRawResponseText()))
+                turn.AppendAssistantChunk("(local backend returned empty content)");
 
-            // Slice 4: feed complete non-streaming text as one synthetic chunk through the turn segmenter.
-            turn.AppendAssistantChunk(providerText);
+            WarnIfOutputLengthLimited(finishReason, config.GetRequestMaxTokens());
+
             turn.Complete();
-
             reply = turn.GetRawResponseText();
             MateChatPresentationModel.Session.CompleteAssistant(turn);
 
@@ -244,7 +268,7 @@ public class MateOpenAICharacter : LLMCharacter
         }
         catch (OperationCanceledException)
         {
-            MateChatPresentationModel.Session.CancelTurn(turn.TurnId);
+            MateChatPresentationModel.Session.CancelTurn(turn.TurnId, turn);
             reply = turn.GetRawResponseText();
             // Cancellation is truthful; no assistant history append.
         }
@@ -253,7 +277,7 @@ public class MateOpenAICharacter : LLMCharacter
             if (IsCurrentTurn(turn.TurnId) && turn.State == MateConversationTurn.TurnState.Running)
             {
                 turn.Fail(ex.Message);
-                MateChatPresentationModel.Session.FailTurn(turn.TurnId, ex.Message);
+                MateChatPresentationModel.Session.FailTurn(turn.TurnId, ex.Message, turn);
                 string fail = "Local OpenAI backend failed: " + ex.Message;
                 Debug.LogError($"{LogPrefix} {fail}");
                 // Failed turns are not appended to conversation history.
@@ -262,7 +286,7 @@ public class MateOpenAICharacter : LLMCharacter
             }
             else
             {
-                MateChatPresentationModel.Session.CancelTurn(turn.TurnId);
+                MateChatPresentationModel.Session.CancelTurn(turn.TurnId, turn);
                 reply = turn.GetRawResponseText();
                 Debug.Log($"{LogPrefix} Ignoring late provider error for terminal turn {turn.TurnId}: {ex.Message}");
             }
@@ -288,7 +312,7 @@ public class MateOpenAICharacter : LLMCharacter
         {
             var id = activeTurn.TurnId;
             activeTurn.Cancel();
-            MateChatPresentationModel.Session.CancelTurn(id);
+            MateChatPresentationModel.Session.CancelTurn(id, activeTurn);
         }
 
         try
@@ -317,7 +341,7 @@ public class MateOpenAICharacter : LLMCharacter
         CancelRequests();
     }
 
-    async Task<string> PostChatCompletions(List<ChatMessage> messages, Guid turnId)
+    async Task<(string content, string finishReason)> PostChatCompletions(List<ChatMessage> messages, Guid turnId)
     {
         if (config == null) throw new InvalidOperationException("MateOpenAI config missing");
         if (string.IsNullOrWhiteSpace(config.model))
@@ -325,7 +349,7 @@ public class MateOpenAICharacter : LLMCharacter
 
         string url = config.ChatCompletionsUrl;
         int maxOutputTokens = config.GetRequestMaxTokens();
-        string json = BuildChatCompletionJson(config.model, messages, config.temperature, maxOutputTokens);
+        string json = BuildChatCompletionJson(config.model, messages, config.temperature, maxOutputTokens, stream: false);
 
         byte[] body = Encoding.UTF8.GetBytes(json);
         using (var req = new UnityWebRequest(url, UnityWebRequest.kHttpVerbPOST))
@@ -369,11 +393,162 @@ public class MateOpenAICharacter : LLMCharacter
             if (!TryParseChatCompletion(responseText, out string content, out string finishReason))
                 throw new InvalidOperationException("Response missing choices[0].message.content");
 
-            WarnIfOutputLengthLimited(finishReason, maxOutputTokens);
-
             // Preserve Slice 3 extraction behavior (trim) as the accepted assistant text.
             // finish_reason=length still yields a successful Completed turn with preserved partial text.
-            return content.Trim();
+            return (content.Trim(), finishReason);
+        }
+    }
+
+    /// <summary>
+    /// Real provider SSE streaming path. Appends deltas into the active turn and
+    /// publishes incremental presentation updates. Returns provider finish_reason.
+    /// </summary>
+    async Task<string> StreamChatCompletions(List<ChatMessage> messages, Guid turnId)
+    {
+        if (config == null) throw new InvalidOperationException("MateOpenAI config missing");
+        if (string.IsNullOrWhiteSpace(config.model))
+            throw new InvalidOperationException("MateOpenAIConfig.model is empty — set it to a local server model id");
+
+        string url = config.ChatCompletionsUrl;
+        int maxOutputTokens = config.GetRequestMaxTokens();
+        string json = BuildChatCompletionJson(config.model, messages, config.temperature, maxOutputTokens, stream: true);
+
+        byte[] body = Encoding.UTF8.GetBytes(json);
+        var handler = new MateOpenAIStreamDownloadHandler();
+        using (var req = new UnityWebRequest(url, UnityWebRequest.kHttpVerbPOST))
+        {
+            req.uploadHandler = new UploadHandlerRaw(body);
+            req.downloadHandler = handler;
+            req.SetRequestHeader("Content-Type", "application/json");
+            req.SetRequestHeader("Accept", "text/event-stream");
+            if (!string.IsNullOrEmpty(config.apiKey))
+                req.SetRequestHeader("Authorization", "Bearer " + config.apiKey);
+            req.timeout = Mathf.Clamp(config.timeoutSeconds, 5, 600);
+
+            if (!IsCurrentTurn(turnId) || activeTurn.State != MateConversationTurn.TurnState.Running)
+                throw new OperationCanceledException("Turn is not running");
+
+            activeRequest = req;
+            Debug.Log($"{LogPrefix} streaming response started");
+            try
+            {
+                var op = req.SendWebRequest();
+
+                string finishReason = null;
+                bool sawDone = false;
+                bool sawContent = false;
+                int presentRevisionBudget = 0;
+
+                while (!op.isDone)
+                {
+                    if (!IsCurrentTurn(turnId) || activeTurn.State != MateConversationTurn.TurnState.Running)
+                    {
+                        try { req.Abort(); } catch { }
+                        throw new OperationCanceledException("Turn cancelled");
+                    }
+
+                    while (handler.Events.TryDequeue(out var ev))
+                    {
+                        ApplyStreamEvent(ev, turnId, ref finishReason, ref sawDone, ref sawContent, ref presentRevisionBudget);
+                    }
+
+                    await Task.Yield();
+                }
+
+                // Drain trailing events after download completes.
+                while (handler.Events.TryDequeue(out var ev))
+                    ApplyStreamEvent(ev, turnId, ref finishReason, ref sawDone, ref sawContent, ref presentRevisionBudget);
+
+                if (!IsCurrentTurn(turnId) || activeTurn.State == MateConversationTurn.TurnState.Cancelled)
+                    throw new OperationCanceledException("Turn cancelled");
+
+                if (req.result != UnityWebRequest.Result.Success)
+                {
+                    if (activeTurn != null && activeTurn.State == MateConversationTurn.TurnState.Cancelled)
+                        throw new OperationCanceledException("Request aborted after cancel");
+
+                    string errBody = req.downloadHandler != null ? req.downloadHandler.text : null;
+                    string snippet = string.IsNullOrEmpty(errBody) ? req.error :
+                        (errBody.Length > 300 ? errBody.Substring(0, 300) + "..." : errBody);
+                    throw new InvalidOperationException($"HTTP {(long)req.responseCode} from {url}: {snippet}");
+                }
+
+                if (!IsCurrentTurn(turnId) || activeTurn.State != MateConversationTurn.TurnState.Running)
+                    throw new OperationCanceledException("Turn no longer accepts provider content");
+
+                if (string.IsNullOrEmpty(finishReason))
+                {
+                    if (sawDone)
+                        finishReason = "stop";
+                    else
+                    {
+                        Debug.LogError($"{LogPrefix} streaming transport ended before terminal event");
+                        throw new InvalidOperationException("streaming transport ended before terminal event");
+                    }
+                }
+
+                Debug.Log($"{LogPrefix} streaming response completed: {finishReason}");
+                if (IsCurrentTurn(turnId) && activeTurn.State == MateConversationTurn.TurnState.Running)
+                    MateChatPresentationModel.Session.UpdateRunningAssistant(activeTurn);
+
+                return finishReason;
+            }
+            finally
+            {
+                if (activeRequest == req) activeRequest = null;
+            }
+        }
+    }
+
+    void ApplyStreamEvent(
+        MateOpenAISseEvent ev,
+        Guid turnId,
+        ref string finishReason,
+        ref bool sawDone,
+        ref bool sawContent,
+        ref int presentRevisionBudget)
+    {
+        if (!IsCurrentTurn(turnId) || activeTurn == null) return;
+        if (activeTurn.State != MateConversationTurn.TurnState.Running) return;
+
+        switch (ev.Kind)
+        {
+            case MateOpenAISseEventKind.ContentDelta:
+                if (!string.IsNullOrEmpty(ev.Text))
+                {
+                    activeTurn.AppendAssistantChunk(ev.Text);
+                    sawContent = true;
+                    presentRevisionBudget++;
+                    // Publish every delta for true streaming visibility (no artificial delay).
+                    MateChatPresentationModel.Session.UpdateRunningAssistant(activeTurn);
+                }
+                if (!string.IsNullOrEmpty(ev.FinishReason) && string.IsNullOrEmpty(finishReason))
+                    finishReason = ev.FinishReason;
+                break;
+
+            case MateOpenAISseEventKind.ReasoningDelta:
+                if (!string.IsNullOrEmpty(ev.Text))
+                {
+                    activeTurn.AppendReasoningChunk(ev.Text);
+                    // Reasoning stays hidden; still bump so state stays coherent without prose merge.
+                    MateChatPresentationModel.Session.UpdateRunningAssistant(activeTurn);
+                }
+                if (!string.IsNullOrEmpty(ev.FinishReason) && string.IsNullOrEmpty(finishReason))
+                    finishReason = ev.FinishReason;
+                break;
+
+            case MateOpenAISseEventKind.FinishReason:
+                if (!string.IsNullOrEmpty(ev.FinishReason) && string.IsNullOrEmpty(finishReason))
+                    finishReason = ev.FinishReason;
+                break;
+
+            case MateOpenAISseEventKind.Done:
+                sawDone = true;
+                break;
+
+            case MateOpenAISseEventKind.ParseError:
+                Debug.LogError($"{LogPrefix} streaming SSE parse failed");
+                throw new InvalidOperationException(ev.ErrorMessage ?? "streaming SSE parse failed");
         }
     }
 
@@ -388,11 +563,16 @@ public class MateOpenAICharacter : LLMCharacter
     }
 
     /// <summary>
-    /// Build the non-streaming chat.completions request body.
+    /// Build chat.completions request body.
     /// <paramref name="maxOutputTokens"/> is max assistant completion size (provider max_tokens).
-    /// Exposed for deterministic output-budget verification.
+    /// <paramref name="stream"/> selects provider SSE streaming vs buffered completion.
     /// </summary>
-    public static string BuildChatCompletionJson(string model, List<ChatMessage> messages, float temperature, int maxOutputTokens)
+    public static string BuildChatCompletionJson(
+        string model,
+        List<ChatMessage> messages,
+        float temperature,
+        int maxOutputTokens,
+        bool stream = false)
     {
         int tokens = MateOpenAIConfig.ResolveMaxOutputTokens(maxOutputTokens);
         var sb = new StringBuilder(256 + (messages?.Count ?? 0) * 64);
@@ -400,7 +580,7 @@ public class MateOpenAICharacter : LLMCharacter
         sb.Append("\"model\":\"").Append(EscapeJson(model ?? "")).Append("\",");
         sb.Append("\"temperature\":").Append(temperature.ToString(System.Globalization.CultureInfo.InvariantCulture)).Append(',');
         sb.Append("\"max_tokens\":").Append(tokens).Append(',');
-        sb.Append("\"stream\":false,");
+        sb.Append("\"stream\":").Append(stream ? "true" : "false").Append(',');
         sb.Append("\"messages\":[");
         if (messages != null)
         {

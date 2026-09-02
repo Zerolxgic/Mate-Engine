@@ -41,6 +41,20 @@ public sealed class MateResponseSegmenter
         return true;
     }
 
+    /// <summary>
+    /// Append provider reasoning/thinking text as a hidden Reasoning segment.
+    /// Does not enter the prose/code fence stream and is excluded from provider history raw text.
+    /// </summary>
+    public bool AppendReasoning(string chunk)
+    {
+        if (frozen) return false;
+        if (string.IsNullOrEmpty(chunk)) return true;
+        finalized.Add(new MateResponseSegment(
+            turnId, nextSequence++, MateResponseSegmentKind.Reasoning,
+            chunk, chunk, "", true, false));
+        return true;
+    }
+
     public void Finish(bool freeze)
     {
         if (frozen) return;
@@ -86,7 +100,15 @@ public sealed class MateResponseSegmenter
     {
         var sb = new StringBuilder();
         for (int i = 0; i < finalized.Count; i++)
-            sb.Append(finalized[i].RawText);
+        {
+            var seg = finalized[i];
+            // Provider-visible history content: prose + fenced code only.
+            if (seg.Kind == MateResponseSegmentKind.Reasoning ||
+                seg.Kind == MateResponseSegmentKind.Tool ||
+                seg.Kind == MateResponseSegmentKind.Control)
+                continue;
+            sb.Append(seg.RawText);
+        }
 
         if (mode == Mode.Prose)
         {

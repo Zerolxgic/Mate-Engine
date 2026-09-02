@@ -154,11 +154,40 @@ function render(state){
     const body = document.createElement('div');
     if(e.speaker === 'Assistant'){
       if(e.state === 'Running' || e.state === 'Pending'){
-        body.innerHTML = `<div class=""pending"">Waiting for response…</div>`;
+        if(e.segments && e.segments.length){
+          body.innerHTML = renderSegments(e.segments);
+          fillCodeBlocks(body, e.segments);
+        } else {
+          body.innerHTML = `<div class=""pending"">Waiting for response…</div>`;
+        }
       } else if(e.state === 'Failed'){
-        body.innerHTML = `<div class=""pending"" style=""color:var(--danger)"">${esc(e.failureMessage||e.plainText||'Failed')}</div>`;
+        let failHtml = `<div class=""pending"" style=""color:var(--danger)"">${esc(e.failureMessage||'Failed')}</div>`;
+        if(e.segments && e.segments.length){
+          body.innerHTML = renderSegments(e.segments) + failHtml;
+          fillCodeBlocks(body, e.segments);
+        } else if(e.plainText && e.plainText !== e.failureMessage){
+          body.textContent = e.plainText;
+          const note = document.createElement('div');
+          note.className = 'pending';
+          note.style.color = 'var(--danger)';
+          note.textContent = e.failureMessage || 'Failed';
+          body.appendChild(note);
+        } else {
+          body.innerHTML = failHtml;
+        }
       } else if(e.state === 'Cancelled'){
-        body.innerHTML = `<div class=""pending"">Cancelled</div>`;
+        if(e.segments && e.segments.length){
+          body.innerHTML = renderSegments(e.segments) + `<div class=""pending"">Cancelled</div>`;
+          fillCodeBlocks(body, e.segments);
+        } else if(e.plainText){
+          body.textContent = e.plainText;
+          const note = document.createElement('div');
+          note.className = 'pending';
+          note.textContent = 'Cancelled';
+          body.appendChild(note);
+        } else {
+          body.innerHTML = `<div class=""pending"">Cancelled</div>`;
+        }
       } else {
         body.innerHTML = renderSegments(e.segments);
         fillCodeBlocks(body, e.segments);

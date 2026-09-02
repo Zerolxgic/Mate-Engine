@@ -57,6 +57,12 @@ public sealed class MateConversationTurn
         return segmenter.Append(chunk ?? "");
     }
 
+    public bool AppendReasoningChunk(string chunk)
+    {
+        if (State != TurnState.Running) return false;
+        return segmenter.AppendReasoning(chunk ?? "");
+    }
+
     public bool Complete()
     {
         if (State != TurnState.Running) return false;

@@ -109,6 +109,9 @@ public sealed class MateChatPresentationModel
         {
             var entry = FindAssistant(turn.TurnId);
             if (entry == null) return;
+            if (entry.State == MateChatEntryState.Cancelled ||
+                entry.State == MateChatEntryState.Failed)
+                return;
             entry.State = MateChatEntryState.Completed;
             entry.FailureMessage = "";
             entry.Segments.Clear();
@@ -121,7 +124,36 @@ public sealed class MateChatPresentationModel
         RaiseChanged();
     }
 
+    /// <summary>
+    /// Incremental mid-stream update for a Running assistant row (Slice 6).
+    /// Rejected once the entry is terminal. Same row — no duplicate assistants.
+    /// </summary>
+    public void UpdateRunningAssistant(MateConversationTurn turn)
+    {
+        if (turn == null) return;
+        lock (gate)
+        {
+            var entry = FindAssistant(turn.TurnId);
+            if (entry == null) return;
+            if (entry.State != MateChatEntryState.Running &&
+                entry.State != MateChatEntryState.Pending)
+                return;
+            entry.Segments.Clear();
+            var segs = turn.GetSegmentsSnapshot();
+            for (int i = 0; i < segs.Count; i++)
+                entry.Segments.Add(ToView(segs[i]));
+            entry.PlainText = turn.GetRawResponseText();
+            revision++;
+        }
+        RaiseChanged();
+    }
+
     public void CancelTurn(Guid turnId)
+    {
+        CancelTurn(turnId, null);
+    }
+
+    public void CancelTurn(Guid turnId, MateConversationTurn turn)
     {
         lock (gate)
         {
@@ -131,8 +163,15 @@ public sealed class MateChatPresentationModel
                 entry.State == MateChatEntryState.Cancelled ||
                 entry.State == MateChatEntryState.Failed)
                 return;
+            if (turn != null)
+            {
+                entry.Segments.Clear();
+                var segs = turn.GetSegmentsSnapshot();
+                for (int i = 0; i < segs.Count; i++)
+                    entry.Segments.Add(ToView(segs[i]));
+                entry.PlainText = turn.GetRawResponseText() ?? entry.PlainText ?? "";
+            }
             entry.State = MateChatEntryState.Cancelled;
-            entry.PlainText = entry.PlainText ?? "";
             revision++;
         }
         RaiseChanged();
@@ -140,15 +179,33 @@ public sealed class MateChatPresentationModel
 
     public void FailTurn(Guid turnId, string message)
     {
+        FailTurn(turnId, message, null);
+    }
+
+    public void FailTurn(Guid turnId, string message, MateConversationTurn turn)
+    {
         lock (gate)
         {
             var entry = FindAssistant(turnId);
             if (entry == null) return;
-            if (entry.State == MateChatEntryState.Completed) return;
+            if (entry.State == MateChatEntryState.Completed ||
+                entry.State == MateChatEntryState.Cancelled ||
+                entry.State == MateChatEntryState.Failed)
+                return;
+            if (turn != null)
+            {
+                entry.Segments.Clear();
+                var segs = turn.GetSegmentsSnapshot();
+                for (int i = 0; i < segs.Count; i++)
+                    entry.Segments.Add(ToView(segs[i]));
+                string partial = turn.GetRawResponseText();
+                if (!string.IsNullOrEmpty(partial))
+                    entry.PlainText = partial;
+            }
             entry.State = MateChatEntryState.Failed;
             entry.FailureMessage = Truncate(message, 500);
-            entry.PlainText = entry.FailureMessage;
-            entry.Segments.Clear();
+            if (string.IsNullOrEmpty(entry.PlainText))
+                entry.PlainText = entry.FailureMessage;
             revision++;
         }
         RaiseChanged();

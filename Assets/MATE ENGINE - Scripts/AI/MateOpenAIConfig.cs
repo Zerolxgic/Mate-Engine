@@ -27,6 +27,12 @@ public class MateOpenAIConfig
     /// </summary>
     public int maxTokens = DefaultMaxOutputTokens;
 
+    /// <summary>
+    /// When true, Mate requests OpenAI-compatible SSE streaming (<c>stream:true</c>).
+    /// When false, uses the accepted non-streaming compatibility path (<c>stream:false</c>).
+    /// </summary>
+    public bool streamResponses = true;
+
     public int timeoutSeconds = 120;
 
     /// <summary>
@@ -105,6 +111,6 @@ public class MateOpenAIConfig
     public void LogSafeSummary()
     {
         Debug.Log($"[MateOpenAI] Config path: {ConfigPath}");
-        Debug.Log($"[MateOpenAI] enabled={enabled} baseUrl={baseUrl} model={model} temperature={temperature} maxTokens={maxTokens} apiKey={(string.IsNullOrEmpty(apiKey) ? "(none)" : "(set)")}");
+        Debug.Log($"[MateOpenAI] enabled={enabled} baseUrl={baseUrl} model={model} temperature={temperature} maxTokens={maxTokens} streamResponses={streamResponses} apiKey={(string.IsNullOrEmpty(apiKey) ? "(none)" : "(set)")}");
     }
 }
