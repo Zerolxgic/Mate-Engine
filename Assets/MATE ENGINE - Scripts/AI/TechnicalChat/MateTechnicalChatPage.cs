@@ -49,6 +49,17 @@ header .status { color:var(--muted); font-size:12px; margin-left:auto; }
 #composer button { border:1px solid var(--border); background:#1f2a3d; color:var(--text); border-radius:8px; padding:0 14px; cursor:pointer; font:inherit; }
 #composer button#cancel { background:#3a2226; color:#ffc9c9; }
 #composer button:disabled { opacity:.45; cursor:default; }
+#voice {
+  border-top:1px solid var(--border); padding:8px 12px; background:#161a22;
+  display:flex; flex-wrap:wrap; gap:8px 12px; align-items:center; font-size:12px; color:var(--muted);
+}
+#voice label { display:flex; align-items:center; gap:6px; }
+#voice select, #voice button {
+  background:#0e1117; color:var(--text); border:1px solid var(--border); border-radius:6px;
+  padding:4px 8px; font:inherit; cursor:pointer;
+}
+#voice button:hover { border-color:var(--accent); }
+#voice .vstatus { margin-left:auto; }
 </style>
 </head>
 <body>
@@ -58,6 +69,15 @@ header .status { color:var(--muted); font-size:12px; margin-left:auto; }
     <span class=""status"" id=""status"">connecting…</span>
   </header>
   <div id=""log""></div>
+  <div id=""voice"">
+    <label>Speech <input type=""checkbox"" id=""speechEnabled""/></label>
+    <span>Provider: <strong id=""speechProvider"">kokoro</strong></span>
+    <span class=""vstatus"" id=""speechStatus"">Unknown</span>
+    <label>Voice
+      <select id=""speechVoice""></select>
+    </label>
+    <button type=""button"" id=""speechTest"">Test Voice</button>
+  </div>
   <div id=""composer"">
     <textarea id=""input"" placeholder=""Message Mate…  Enter send · Shift+Enter newline""></textarea>
     <button id=""cancel"" type=""button"" disabled>Cancel</button>
@@ -70,7 +90,13 @@ const input = document.getElementById('input');
 const sendBtn = document.getElementById('send');
 const cancelBtn = document.getElementById('cancel');
 const statusEl = document.getElementById('status');
+const speechEnabled = document.getElementById('speechEnabled');
+const speechProvider = document.getElementById('speechProvider');
+const speechStatus = document.getElementById('speechStatus');
+const speechVoice = document.getElementById('speechVoice');
+const speechTest = document.getElementById('speechTest');
 let hasRunning = false;
+let speechApplyBusy = false;
 
 function applyTheme(t){
   if(!t) return;
@@ -266,6 +292,70 @@ input.addEventListener('keydown', e => {
 });
 
 refresh().then(connectSse);
+refreshSpeech();
+setInterval(refreshSpeech, 4000);
+
+async function refreshSpeech(){
+  try {
+    const r = await fetch('/api/speech/state');
+    const j = await r.json();
+    renderSpeech(j);
+  } catch {
+    speechStatus.textContent = 'Unavailable';
+  }
+}
+
+function renderSpeech(s){
+  if(!s) return;
+  speechApplyBusy = true;
+  speechEnabled.checked = !!s.speechOutputEnabled;
+  speechProvider.textContent = s.providerId || 'kokoro';
+  speechStatus.textContent = s.status || 'Unknown';
+  if(s.lastError) speechStatus.textContent = (s.status || 'Unavailable') + ' — ' + s.lastError;
+  const voices = s.voices || [];
+  const cur = s.selectedVoice || '';
+  const prev = speechVoice.value;
+  speechVoice.innerHTML = '';
+  if(!voices.length && cur){
+    const opt = document.createElement('option');
+    opt.value = cur; opt.textContent = cur; speechVoice.appendChild(opt);
+  }
+  for(const v of voices){
+    const opt = document.createElement('option');
+    opt.value = v.id; opt.textContent = v.name || v.id;
+    speechVoice.appendChild(opt);
+  }
+  if(cur) speechVoice.value = cur;
+  else if(prev) speechVoice.value = prev;
+  speechApplyBusy = false;
+}
+
+async function applySpeech(patch){
+  try {
+    const r = await fetch('/api/speech/config', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(patch)
+    });
+    const j = await r.json();
+    if(j && j.speech) renderSpeech(j.speech);
+    else await refreshSpeech();
+  } catch {
+    speechStatus.textContent = 'Unavailable';
+  }
+}
+
+speechEnabled.onchange = () => {
+  if(speechApplyBusy) return;
+  applySpeech({ speechOutputEnabled: !!speechEnabled.checked });
+};
+speechVoice.onchange = () => {
+  if(speechApplyBusy) return;
+  applySpeech({ selectedVoice: speechVoice.value });
+};
+speechTest.onclick = async () => {
+  try { await fetch('/api/speech/test', { method:'POST' }); } catch {}
+};
 </script>
 </body>
 </html>";

@@ -107,6 +107,11 @@ public static class MateOpenAIChatBootstrap
         }
 
         activated = true;
+        try { MateSpeechService.Ensure(); }
+        catch (Exception speechEx)
+        {
+            Debug.LogWarning($"{LogPrefix} Speech service bootstrap skipped: {speechEx.Message}");
+        }
         Debug.Log($"{LogPrefix} OpenAI backend ACTIVE for ChatBot '{chatBot.gameObject.name}' (hierarchyActive={chatBot.gameObject.activeInHierarchy}). Target={config.ChatCompletionsUrl} model={config.model}");
         return true;
     }

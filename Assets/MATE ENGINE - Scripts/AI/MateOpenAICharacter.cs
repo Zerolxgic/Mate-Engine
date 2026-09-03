@@ -197,6 +197,7 @@ public class MateOpenAICharacter : LLMCharacter
         activeTurn = turn;
 
         MateChatPresentationModel.Session.BeginUserTurn(turn.TurnId, query);
+        NotifySpeechTurnStarted(turn.TurnId);
 
         var messages = new List<ChatMessage>(chat);
         messages.Add(new ChatMessage { role = NormalizeRole(playerName), content = query });
@@ -220,6 +221,7 @@ public class MateOpenAICharacter : LLMCharacter
                 if (!IsCurrentTurn(turn.TurnId) || turn.State != MateConversationTurn.TurnState.Running)
                 {
                     MateChatPresentationModel.Session.CancelTurn(turn.TurnId, turn);
+                    NotifySpeechTurnCancelled(turn.TurnId);
                     reply = turn.GetRawResponseText();
                     completionCallback?.Invoke();
                     return reply;
@@ -229,12 +231,14 @@ public class MateOpenAICharacter : LLMCharacter
                     providerText = "(local backend returned empty content)";
 
                 turn.AppendAssistantChunk(providerText);
+                NotifySpeechSegmentsUpdated(turn);
             }
 
             if (!IsCurrentTurn(turn.TurnId) || turn.State != MateConversationTurn.TurnState.Running)
             {
                 // Cancelled or superseded — do not mutate history or UI with late success.
                 MateChatPresentationModel.Session.CancelTurn(turn.TurnId, turn);
+                NotifySpeechTurnCancelled(turn.TurnId);
                 reply = turn.GetRawResponseText();
                 completionCallback?.Invoke();
                 return reply;
@@ -248,6 +252,7 @@ public class MateOpenAICharacter : LLMCharacter
             turn.Complete();
             reply = turn.GetRawResponseText();
             MateChatPresentationModel.Session.CompleteAssistant(turn);
+            NotifySpeechTurnCompleted(turn);
 
             if (addToHistory && IsCurrentTurn(turn.TurnId) && turn.State == MateConversationTurn.TurnState.Completed)
             {
@@ -269,6 +274,7 @@ public class MateOpenAICharacter : LLMCharacter
         catch (OperationCanceledException)
         {
             MateChatPresentationModel.Session.CancelTurn(turn.TurnId, turn);
+            NotifySpeechTurnCancelled(turn.TurnId);
             reply = turn.GetRawResponseText();
             // Cancellation is truthful; no assistant history append.
         }
@@ -278,6 +284,7 @@ public class MateOpenAICharacter : LLMCharacter
             {
                 turn.Fail(ex.Message);
                 MateChatPresentationModel.Session.FailTurn(turn.TurnId, ex.Message, turn);
+                NotifySpeechTurnCancelled(turn.TurnId);
                 string fail = "Local OpenAI backend failed: " + ex.Message;
                 Debug.LogError($"{LogPrefix} {fail}");
                 // Failed turns are not appended to conversation history.
@@ -287,6 +294,7 @@ public class MateOpenAICharacter : LLMCharacter
             else
             {
                 MateChatPresentationModel.Session.CancelTurn(turn.TurnId, turn);
+                NotifySpeechTurnCancelled(turn.TurnId);
                 reply = turn.GetRawResponseText();
                 Debug.Log($"{LogPrefix} Ignoring late provider error for terminal turn {turn.TurnId}: {ex.Message}");
             }
@@ -308,12 +316,18 @@ public class MateOpenAICharacter : LLMCharacter
 
     void CancelActiveTurnLocal()
     {
+        Guid cancelledId = Guid.Empty;
         if (activeTurn != null && activeTurn.State == MateConversationTurn.TurnState.Running)
         {
-            var id = activeTurn.TurnId;
+            cancelledId = activeTurn.TurnId;
             activeTurn.Cancel();
-            MateChatPresentationModel.Session.CancelTurn(id, activeTurn);
+            MateChatPresentationModel.Session.CancelTurn(cancelledId, activeTurn);
         }
+
+        if (cancelledId != Guid.Empty)
+            NotifySpeechTurnCancelled(cancelledId);
+        else
+            NotifySpeechCancelActive();
 
         try
         {
@@ -324,6 +338,38 @@ public class MateOpenAICharacter : LLMCharacter
             }
         }
         catch { }
+    }
+
+    static void NotifySpeechTurnStarted(Guid turnId)
+    {
+        try { MateSpeechService.Current?.OnTurnStarted(turnId); }
+        catch (Exception ex) { Debug.LogWarning($"{LogPrefix} speech start notify failed: {ex.Message}"); }
+    }
+
+    static void NotifySpeechSegmentsUpdated(MateConversationTurn turn)
+    {
+        if (turn == null) return;
+        try { MateSpeechService.Current?.OnSegmentsUpdated(turn.TurnId, turn.GetSegmentsSnapshot()); }
+        catch (Exception ex) { Debug.LogWarning($"{LogPrefix} speech update notify failed: {ex.Message}"); }
+    }
+
+    static void NotifySpeechTurnCompleted(MateConversationTurn turn)
+    {
+        if (turn == null) return;
+        try { MateSpeechService.Current?.OnTurnCompleted(turn.TurnId, turn.GetSegmentsSnapshot()); }
+        catch (Exception ex) { Debug.LogWarning($"{LogPrefix} speech complete notify failed: {ex.Message}"); }
+    }
+
+    static void NotifySpeechTurnCancelled(Guid turnId)
+    {
+        try { MateSpeechService.Current?.OnTurnCancelled(turnId); }
+        catch (Exception ex) { Debug.LogWarning($"{LogPrefix} speech cancel notify failed: {ex.Message}"); }
+    }
+
+    static void NotifySpeechCancelActive()
+    {
+        try { MateSpeechService.Current?.CancelActiveSpeech(); }
+        catch (Exception ex) { Debug.LogWarning($"{LogPrefix} speech cancel-active failed: {ex.Message}"); }
     }
 
     bool IsCurrentTurn(Guid turnId)
@@ -521,6 +567,7 @@ public class MateOpenAICharacter : LLMCharacter
                     presentRevisionBudget++;
                     // Publish every delta for true streaming visibility (no artificial delay).
                     MateChatPresentationModel.Session.UpdateRunningAssistant(activeTurn);
+                    NotifySpeechSegmentsUpdated(activeTurn);
                 }
                 if (!string.IsNullOrEmpty(ev.FinishReason) && string.IsNullOrEmpty(finishReason))
                     finishReason = ev.FinishReason;

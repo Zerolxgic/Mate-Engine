@@ -324,6 +324,85 @@ public sealed class MateTechnicalChatHost : MonoBehaviour
             return;
         }
 
+        if (ctx.Request.HttpMethod == "GET" && path == "/api/speech/state")
+        {
+            var tcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+            mainThread.Enqueue(() =>
+            {
+                try
+                {
+                    MateTechnicalChatController.RequestVoiceRefresh();
+                    tcs.TrySetResult(MateTechnicalChatController.BuildSpeechStateJson());
+                }
+                catch (Exception ex)
+                {
+                    tcs.TrySetException(ex);
+                }
+            });
+            bool done = false;
+            try { done = tcs.Task.Wait(5000); } catch { }
+            if (!done || tcs.Task.IsFaulted)
+                WriteText(ctx.Response, 500, "application/json", "{\"ok\":false,\"error\":\"speech state failed\"}");
+            else
+                WriteText(ctx.Response, 200, "application/json; charset=utf-8", tcs.Task.Result);
+            return;
+        }
+
+        if (ctx.Request.HttpMethod == "POST" && path == "/api/speech/config")
+        {
+            string body = ReadBody(ctx.Request);
+            var tcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+            mainThread.Enqueue(() =>
+            {
+                try
+                {
+                    if (!MateTechnicalChatController.TryApplySpeechConfig(body, out string err))
+                        tcs.TrySetResult("{\"ok\":false,\"error\":\"" + EscapeJson(err ?? "rejected") + "\"}");
+                    else
+                        tcs.TrySetResult("{\"ok\":true,\"speech\":" + MateTechnicalChatController.BuildSpeechStateJson() + "}");
+                }
+                catch (Exception ex)
+                {
+                    tcs.TrySetException(ex);
+                }
+            });
+            bool done = false;
+            try { done = tcs.Task.Wait(5000); } catch { }
+            if (!done || tcs.Task.IsFaulted)
+                WriteText(ctx.Response, 500, "application/json", "{\"ok\":false,\"error\":\"speech config failed\"}");
+            else
+            {
+                string result = tcs.Task.Result;
+                int code = result != null && result.Contains("\"ok\":false") ? 400 : 200;
+                WriteText(ctx.Response, code, "application/json; charset=utf-8", result);
+            }
+            return;
+        }
+
+        if (ctx.Request.HttpMethod == "POST" && path == "/api/speech/test")
+        {
+            var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            mainThread.Enqueue(() =>
+            {
+                try
+                {
+                    MateTechnicalChatController.TestVoiceFromUi();
+                    tcs.TrySetResult(true);
+                }
+                catch (Exception ex)
+                {
+                    tcs.TrySetException(ex);
+                }
+            });
+            bool done = false;
+            try { done = tcs.Task.Wait(5000); } catch { }
+            if (!done || tcs.Task.IsFaulted)
+                WriteText(ctx.Response, 500, "application/json", "{\"ok\":false,\"error\":\"speech test failed\"}");
+            else
+                WriteText(ctx.Response, 200, "application/json", "{\"ok\":true}");
+            return;
+        }
+
         WriteText(ctx.Response, 404, "text/plain", "not found");
     }
 
