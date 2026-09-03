@@ -9,12 +9,12 @@ using UnityEditor;
 using UnityEngine;
 
 /// <summary>
-/// Deterministic EditMode verification for Slice 7 speech-output foundation (cases 1–19).
-/// Menu: Mate Engine / Verify Speech Output Foundation
+/// Deterministic EditMode verification for Slice 8 speech fluency (preserves Slice 7 cases 1–24).
+/// Menu: Mate Engine / Verify Speech Fluency
 /// </summary>
 public static class MateSpeechOutputVerify
 {
-    const string MenuPath = "Mate Engine/Verify Speech Output Foundation";
+    const string MenuPath = "Mate Engine/Verify Speech Fluency";
     const string LogPrefix = "[MateSpeechVerify]";
 
     [MenuItem(MenuPath)]
@@ -65,10 +65,19 @@ public static class MateSpeechOutputVerify
             ("22", Case22_OpeningStreamedTextEmitsOnce),
             ("23", Case23_ProjectionRewriteDoesNotReplayCommittedOpening),
             ("24", Case24_StreamedCodeSuppressionRemainsOnceOnly),
+            ("25", Case25_FirstChunkAndStrongBoundaryRelease),
+            ("26", Case26_WeakBoundaryThreshold),
+            ("27", Case27_OneChunkPrefetchIsOrdered),
+            ("28", Case28_CancelClearsReadyPrefetch),
+            ("29", Case29_SpeechOffClearsPrefetch),
+            ("30", Case30_PrefetchProviderFailureRecovers),
+            ("31", Case31_VoiceCapturedAtSynthesis),
+            ("32", Case32_TimingLifecycleRecorded),
+            ("33", Case33_PrefetchDepthIsOne),
         };
 
         var sb = new StringBuilder();
-        sb.AppendLine("# Mate Speech Output Foundation Verification");
+        sb.AppendLine("# Mate Speech Fluency Verification");
         sb.AppendLine($"Date: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
         sb.AppendLine();
 
@@ -101,7 +110,7 @@ public static class MateSpeechOutputVerify
 
         string reportDir = Path.GetFullPath(Path.Combine(Application.dataPath, "..", "..", "reports"));
         Directory.CreateDirectory(reportDir);
-        string reportPath = Path.Combine(reportDir, "2026-09-02-Mate-Engine-Slice-7-Speech-Output-Verify.md");
+        string reportPath = Path.Combine(reportDir, "2026-09-02-Mate-Engine-Slice-8-Speech-Fluency-Verify.md");
         File.WriteAllText(reportPath, sb.ToString(), Encoding.UTF8);
 
         return new VerifyResult
@@ -512,6 +521,168 @@ public static class MateSpeechOutputVerify
         AssertTrue(turn.Complete(), "turn complete failed");
         orch.OnTurnCompleted(turn.TurnId, turn.GetSegmentsSnapshot());
         AssertJobTexts(orch, "Intro sentence.", "Closing sentence.");
+    }
+
+    static void Case25_FirstChunkAndStrongBoundaryRelease()
+    {
+        var chunker = new MateSentenceChunker();
+        var first = chunker.Append("This is enough opening text to begin speaking.");
+        AssertTrue(first.Count == 0, "terminal boundary must wait for a following stream boundary");
+        first.AddRange(chunker.Append(" Next sentence arrives."));
+        AssertEq(first[0], "This is enough opening text to begin speaking.", "first strong boundary");
+    }
+
+    static void Case26_WeakBoundaryThreshold()
+    {
+        var chunker = new MateSentenceChunker();
+        AssertTrue(chunker.Append("Short, next").Count == 0, "tiny weak fragment released");
+        string prefix = new string('a', MateSentenceChunker.WeakBoundaryMinChars) + ", next";
+        var released = chunker.Append(prefix);
+        AssertTrue(released.Count == 1, "grown weak boundary did not release");
+    }
+
+    static void Case27_OneChunkPrefetchIsOrdered()
+    {
+        RunSync(async () =>
+        {
+            var provider = new MateFakeTtsProvider();
+            var player = new MateFakeSpeechPlayer { OnPlay = async ct => await Task.Delay(35, ct) };
+            bool nextSynthesizedDuringPlayback = false;
+            provider.BeforeSynthesize = (request, ct) =>
+            {
+                if (request.ChunkIndex == 1) nextSynthesizedDuringPlayback = player.IsPlaying;
+                return Task.CompletedTask;
+            };
+            var orch = MateSpeechOrchestrator.ForTests(provider, player);
+            var turnId = Guid.NewGuid();
+            orch.OnTurnStarted(turnId);
+            orch.OnTurnCompleted(turnId, Segs(turnId, "First complete sentence. Second complete sentence."));
+            await orch.PumpAsync();
+            AssertTrue(nextSynthesizedDuringPlayback, "N+1 did not synthesize during N playback");
+            AssertTrue(player.PlayedJobs.Count == 2, "prefetch play count");
+            AssertTrue(player.PlayedJobs[0].chunkIndex == 0 && player.PlayedJobs[1].chunkIndex == 1, "out-of-order playback");
+        });
+    }
+
+    static void Case28_CancelClearsReadyPrefetch()
+    {
+        RunSync(async () =>
+        {
+            var playerGate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var provider = new MateFakeTtsProvider();
+            var player = new MateFakeSpeechPlayer { OnPlay = async ct => await playerGate.Task };
+            var orch = MateSpeechOrchestrator.ForTests(provider, player);
+            var turnId = Guid.NewGuid();
+            orch.OnTurnStarted(turnId);
+            orch.OnTurnCompleted(turnId, Segs(turnId, "First complete sentence. Second complete sentence."));
+            var pump = orch.PumpAsync();
+            for (int i = 0; i < 100 && provider.SynthesizeCalls < 2; i++) await Task.Delay(10);
+            orch.OnTurnCancelled(turnId);
+            playerGate.TrySetResult(true);
+            await pump;
+            AssertTrue(!orch.HasReadyPrefetch, "ready prefetch survived cancellation");
+            AssertTrue(player.PlayedJobs.Count <= 1, "cancelled prefetched audio played");
+        });
+    }
+
+    static void Case29_SpeechOffClearsPrefetch()
+    {
+        RunSync(async () =>
+        {
+            var gate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var provider = new MateFakeTtsProvider();
+            var player = new MateFakeSpeechPlayer { OnPlay = async ct => await gate.Task };
+            var orch = MateSpeechOrchestrator.ForTests(provider, player);
+            var turnId = Guid.NewGuid();
+            orch.OnTurnStarted(turnId);
+            orch.OnTurnCompleted(turnId, Segs(turnId, "First complete sentence. Second complete sentence."));
+            var pump = orch.PumpAsync();
+            for (int i = 0; i < 100 && provider.SynthesizeCalls < 2; i++) await Task.Delay(10);
+            orch.SetSpeechOutputEnabled(false, save: false);
+            gate.TrySetResult(true);
+            await pump;
+            AssertTrue(!orch.HasReadyPrefetch && orch.QueuedCount == 0, "speech off retained prefetched work");
+        });
+    }
+
+    static void Case30_PrefetchProviderFailureRecovers()
+    {
+        RunSync(async () =>
+        {
+            var provider = new MateFakeTtsProvider();
+            provider.BeforeSynthesize = (request, ct) =>
+            {
+                if (request.ChunkIndex == 1) throw new InvalidOperationException("prefetch failure");
+                return Task.CompletedTask;
+            };
+            var player = new MateFakeSpeechPlayer { OnPlay = async ct => await Task.Delay(20, ct) };
+            var orch = MateSpeechOrchestrator.ForTests(provider, player);
+            var t1 = Guid.NewGuid();
+            orch.OnTurnStarted(t1);
+            orch.OnTurnCompleted(t1, Segs(t1, "First complete sentence. Failed next sentence."));
+            await orch.PumpAsync();
+            AssertTrue(player.PlayedJobs.Count == 1, "failed prefetch played or blocked current");
+            var t2 = Guid.NewGuid();
+            orch.OnTurnStarted(t2);
+            orch.OnTurnCompleted(t2, Segs(t2, "Fresh turn recovers."));
+            await orch.PumpAsync();
+            AssertTrue(player.PlayedJobs.Exists(x => x.turnId == t2), "provider failure wedged fresh turn");
+        });
+    }
+
+    static void Case31_VoiceCapturedAtSynthesis()
+    {
+        RunSync(async () =>
+        {
+            var provider = new MateFakeTtsProvider();
+            var orch = MateSpeechOrchestrator.ForTests(provider, null, new MateSpeechConfig { selectedVoice = "voice_a" });
+            var turnId = Guid.NewGuid();
+            orch.OnTurnStarted(turnId);
+            orch.OnTurnCompleted(turnId, Segs(turnId, "First complete sentence."));
+            await orch.PumpAsync();
+            orch.SetSelectedVoice("voice_b", save: false);
+            var next = Guid.NewGuid();
+            orch.OnTurnStarted(next);
+            orch.OnTurnCompleted(next, Segs(next, "Second complete sentence."));
+            await orch.PumpAsync();
+            AssertEq(provider.Requests[0].VoiceId, "voice_a", "first voice");
+            AssertEq(provider.Requests[1].VoiceId, "voice_b", "future voice");
+        });
+    }
+
+    static void Case32_TimingLifecycleRecorded()
+    {
+        RunSync(async () =>
+        {
+            var orch = MateSpeechOrchestrator.ForTests(new MateFakeTtsProvider(), new MateFakeSpeechPlayer());
+            var turnId = Guid.NewGuid();
+            orch.OnTurnStarted(turnId);
+            orch.OnTurnCompleted(turnId, Segs(turnId, "Timed complete sentence."));
+            await orch.PumpAsync();
+            var timing = orch.TimingsForTests[0];
+            AssertTrue(timing.QueuedUtc != default && timing.SynthesisStartedUtc != default &&
+                timing.SynthesisCompletedUtc != default && timing.PlaybackStartedUtc != default &&
+                timing.PlaybackCompletedUtc != default, "missing timing lifecycle point");
+        });
+    }
+
+    static void Case33_PrefetchDepthIsOne()
+    {
+        RunSync(async () =>
+        {
+            var gate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var provider = new MateFakeTtsProvider();
+            var player = new MateFakeSpeechPlayer { OnPlay = async ct => await gate.Task };
+            var orch = MateSpeechOrchestrator.ForTests(provider, player);
+            var turnId = Guid.NewGuid();
+            orch.OnTurnStarted(turnId);
+            orch.OnTurnCompleted(turnId, Segs(turnId, "One complete sentence. Two complete sentence. Three complete sentence."));
+            var pump = orch.PumpAsync();
+            for (int i = 0; i < 100 && provider.SynthesizeCalls < 2; i++) await Task.Delay(10);
+            AssertTrue(provider.SynthesizeCalls == 2, "more than one future synthesis started");
+            gate.TrySetResult(true);
+            await pump;
+        });
     }
 
     static void AssertJobTexts(MateSpeechOrchestrator orch, params string[] expected)

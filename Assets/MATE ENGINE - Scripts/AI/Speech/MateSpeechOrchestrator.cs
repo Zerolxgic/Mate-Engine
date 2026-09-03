@@ -5,7 +5,7 @@ using System.Threading.Tasks;
 using UnityEngine;
 
 /// <summary>
-/// Owns speech lifecycle: projection deltas → sentence chunks → sequential synth/play.
+/// Owns speech lifecycle: projection deltas → sentence chunks → ordered one-chunk prefetch.
 /// TTS failures never fail conversation turns.
 /// </summary>
 public sealed class MateSpeechOrchestrator
@@ -39,6 +39,7 @@ public sealed class MateSpeechOrchestrator
     CancellationTokenSource workCts = new CancellationTokenSource();
     bool workerRunning;
     bool autoPump;
+    ReadySpeech readyPrefetch;
     string lastError;
     MateTtsConnectionStatus status = MateTtsConnectionStatus.Unknown;
     MateSpeechLifecycleState state = MateSpeechLifecycleState.Idle;
@@ -47,6 +48,7 @@ public sealed class MateSpeechOrchestrator
     public List<SpeechJob> EnqueuedJobsForTests { get; } = new List<SpeechJob>();
     public List<SpeechJob> CompletedJobsForTests { get; } = new List<SpeechJob>();
     public List<SpeechJob> RejectedLateJobsForTests { get; } = new List<SpeechJob>();
+    public List<SpeechTiming> TimingsForTests { get; } = new List<SpeechTiming>();
 
     public MateSpeechLifecycleState State => state;
     public MateTtsConnectionStatus ConnectionStatus => status;
@@ -207,6 +209,7 @@ public sealed class MateSpeechOrchestrator
         {
             generation++;
             queue.Clear();
+            readyPrefetch = null;
             chunker.Reset();
             consumedSpeakableLength = 0;
             committedSpeakableLength = 0;
@@ -276,6 +279,7 @@ public sealed class MateSpeechOrchestrator
         if (autoPump)
             EnsureWorker();
     }
+    public bool HasReadyPrefetch { get { lock (gate) return readyPrefetch != null; } }
 
     static int CommonPrefixLength(string left, string right)
     {
@@ -302,8 +306,10 @@ public sealed class MateSpeechOrchestrator
             if (gen != generation) return;
             if (activeTurnId != turnId) return;
             job = new SpeechJob(turnId, nextChunkIndex++, text, gen);
+            job.Timing.QueuedUtc = DateTime.UtcNow;
             queue.Enqueue(job);
             EnqueuedJobsForTests.Add(job);
+            TimingsForTests.Add(job.Timing);
         }
         RaiseChanged();
     }
@@ -314,7 +320,7 @@ public sealed class MateSpeechOrchestrator
         for (int i = 0; i < maxSteps; i++)
         {
             bool hasWork;
-            lock (gate) hasWork = queue.Count > 0 || workerRunning;
+            lock (gate) hasWork = queue.Count > 0 || readyPrefetch != null || workerRunning;
             if (!hasWork && state == MateSpeechLifecycleState.Idle)
                 break;
             if (!workerRunning)
@@ -326,7 +332,7 @@ public sealed class MateSpeechOrchestrator
         while (true)
         {
             bool has;
-            lock (gate) has = queue.Count > 0;
+            lock (gate) has = queue.Count > 0 || readyPrefetch != null;
             if (!has) break;
             await RunWorkerOnce();
         }
@@ -365,121 +371,160 @@ public sealed class MateSpeechOrchestrator
 
     async Task<bool> RunWorkerOnce()
     {
-        SpeechJob job;
-        lock (gate)
+        ReadySpeech current = await TakeReadyOrNextAsync();
+        if (current == null) return false;
+        if (!IsReadyValid(current))
         {
-            if (queue.Count == 0) return false;
-            job = queue.Dequeue();
+            RejectedLateJobsForTests.Add(current.Job);
+            return QueuedRemaining();
         }
 
-        if (!IsJobValid(job))
+        if (player == null)
         {
-            RejectedLateJobsForTests.Add(job);
-            return true;
+            CompletedJobsForTests.Add(current.Job);
+            return QueuedRemaining();
         }
 
-        if (player is MateFakeSpeechPlayer fake)
-            fake.RememberJob(job.TurnId, job.ChunkIndex);
-
+        CancellationToken token;
+        lock (gate) token = workCts.Token;
         try
         {
-            state = MateSpeechLifecycleState.Synthesizing;
-            RaiseChanged();
-
-            CancellationToken token;
-            lock (gate) token = workCts.Token;
-
-            var request = new MateTtsRequest(job.TurnId, job.ChunkIndex, job.Text, config.selectedVoice);
-            MateTtsSynthesisResult result;
-            try
-            {
-                result = await provider.SynthesizeAsync(request, token);
-            }
-            catch (OperationCanceledException)
-            {
-                RejectedLateJobsForTests.Add(job);
-                return QueuedRemaining();
-            }
-            catch (Exception ex)
-            {
-                lastError = ex.Message;
-                status = MateTtsConnectionStatus.Unavailable;
-                Debug.LogWarning($"{LogPrefix} synthesis exception (chat unaffected): {ex.Message}");
-                RaiseChanged();
-                return QueuedRemaining();
-            }
-
-            if (!IsJobValid(job) || job.Generation != generation || token.IsCancellationRequested)
-            {
-                RejectedLateJobsForTests.Add(job);
-                return QueuedRemaining();
-            }
-
-            if (result == null || !result.Success)
-            {
-                lastError = result?.Error ?? "synthesis failed";
-                status = MateTtsConnectionStatus.Unavailable;
-                Debug.LogWarning($"{LogPrefix} synthesis failed (chat unaffected): {lastError}");
-                RaiseChanged();
-                return QueuedRemaining();
-            }
-
-            status = MateTtsConnectionStatus.Connected;
-            lastError = null;
-
-            if (player == null)
-            {
-                // No player attached yet — treat as successful no-op for diagnostics.
-                CompletedJobsForTests.Add(job);
-                return QueuedRemaining();
-            }
-
             state = MateSpeechLifecycleState.Speaking;
-            RaiseChanged();
+            current.Timing.PlaybackStartedUtc = DateTime.UtcNow;
+            if (player is MateFakeSpeechPlayer fake)
+                fake.RememberJob(current.Job.TurnId, current.Job.ChunkIndex);
+            var playback = player.PlayAsync(current.Result.AudioBytes, current.Result.Format, token);
 
-            try
+            // Depth one: remove and synthesize at most the immediately next job.
+            SpeechJob next = DequeueNext();
+            Task<ReadySpeech> prefetch = next == null ? null : SynthesizeAsync(next, token);
+            await playback;
+            current.Timing.PlaybackCompletedUtc = DateTime.UtcNow;
+            LogTiming(current);
+            if (!IsReadyValid(current) || token.IsCancellationRequested)
+                RejectedLateJobsForTests.Add(current.Job);
+            else
+                CompletedJobsForTests.Add(current.Job);
+
+            if (prefetch != null)
             {
-                // Re-check before play to block late cancelled audio.
-                if (!IsJobValid(job) || job.Generation != generation || token.IsCancellationRequested)
+                ReadySpeech ready = await prefetch;
+                if (ready != null && IsReadyValid(ready))
                 {
-                    RejectedLateJobsForTests.Add(job);
-                    try { player.Stop(); } catch { }
-                    return QueuedRemaining();
+                    ready.Timing.PrefetchHit = ready.Timing.SynthesisCompletedUtc <= current.Timing.PlaybackCompletedUtc;
+                    ready.Timing.PreviousPlaybackCompletedUtc = current.Timing.PlaybackCompletedUtc;
+                    lock (gate) readyPrefetch = ready;
                 }
-
-                await player.PlayAsync(result.AudioBytes, result.Format, token);
-
-                if (!IsJobValid(job) || job.Generation != generation || token.IsCancellationRequested)
-                {
-                    RejectedLateJobsForTests.Add(job);
-                    return QueuedRemaining();
-                }
-
-                CompletedJobsForTests.Add(job);
             }
-            catch (OperationCanceledException)
-            {
-                RejectedLateJobsForTests.Add(job);
-            }
-            catch (Exception ex)
-            {
-                lastError = "playback: " + ex.Message;
-                Debug.LogWarning($"{LogPrefix} playback failed (chat unaffected): {ex.Message}");
-                RaiseChanged();
-            }
+        }
+        catch (OperationCanceledException)
+        {
+            RejectedLateJobsForTests.Add(current.Job);
+        }
+        catch (Exception ex)
+        {
+            lastError = "playback: " + ex.Message;
+            Debug.LogWarning($"{LogPrefix} playback failed (chat unaffected): {ex.Message}");
         }
         finally
         {
             state = MateSpeechLifecycleState.Idle;
             RaiseChanged();
         }
-
         return QueuedRemaining();
+    }
+
+    async Task<ReadySpeech> TakeReadyOrNextAsync()
+    {
+        ReadySpeech ready;
+        lock (gate)
+        {
+            ready = readyPrefetch;
+            readyPrefetch = null;
+        }
+        if (ready != null) return ready;
+        SpeechJob job = DequeueNext();
+        if (job == null) return null;
+        CancellationToken token;
+        lock (gate) token = workCts.Token;
+        return await SynthesizeAsync(job, token);
+    }
+
+    SpeechJob DequeueNext()
+    {
+        lock (gate)
+            return queue.Count > 0 ? queue.Dequeue() : null;
+    }
+
+    async Task<ReadySpeech> SynthesizeAsync(SpeechJob job, CancellationToken token)
+    {
+        if (!IsJobValid(job))
+        {
+            RejectedLateJobsForTests.Add(job);
+            return null;
+        }
+        try
+        {
+            state = MateSpeechLifecycleState.Synthesizing;
+            job.Timing.SynthesisStartedUtc = DateTime.UtcNow;
+            string voice = config.selectedVoice;
+            var request = new MateTtsRequest(job.TurnId, job.ChunkIndex, job.Text, voice);
+            MateTtsSynthesisResult result = await provider.SynthesizeAsync(request, token);
+            job.Timing.SynthesisCompletedUtc = DateTime.UtcNow;
+            if (!IsJobValid(job) || token.IsCancellationRequested)
+            {
+                RejectedLateJobsForTests.Add(job);
+                return null;
+            }
+            if (result == null || !result.Success)
+            {
+                lastError = result?.Error ?? "synthesis failed";
+                status = MateTtsConnectionStatus.Unavailable;
+                Debug.LogWarning($"{LogPrefix} synthesis failed (chat unaffected): {lastError}");
+                return null;
+            }
+            status = MateTtsConnectionStatus.Connected;
+            lastError = null;
+            return new ReadySpeech(job, result, voice);
+        }
+        catch (OperationCanceledException)
+        {
+            RejectedLateJobsForTests.Add(job);
+            return null;
+        }
+        catch (Exception ex)
+        {
+            lastError = ex.Message;
+            status = MateTtsConnectionStatus.Unavailable;
+            Debug.LogWarning($"{LogPrefix} synthesis exception (chat unaffected): {ex.Message}");
+            return null;
+        }
+    }
+
+    bool IsReadyValid(ReadySpeech ready)
+    {
+        return ready != null && IsJobValid(ready.Job);
+    }
+
+    static void LogTiming(ReadySpeech ready)
+    {
+        var t = ready.Timing;
+        if (t.QueuedUtc == default || t.SynthesisStartedUtc == default ||
+            t.SynthesisCompletedUtc == default || t.PlaybackStartedUtc == default ||
+            t.PlaybackCompletedUtc == default)
+            return;
+        Debug.Log($"[MateSpeechTiming] turn={ready.Job.TurnId:N} gen={ready.Job.Generation} seq={ready.Job.ChunkIndex} " +
+                  $"queueMs={(t.SynthesisStartedUtc - t.QueuedUtc).TotalMilliseconds:F0} " +
+                  $"synthMs={(t.SynthesisCompletedUtc - t.SynthesisStartedUtc).TotalMilliseconds:F0} " +
+                  $"readyMs={(t.PlaybackStartedUtc - t.SynthesisCompletedUtc).TotalMilliseconds:F0} " +
+                  $"transitionMs={(t.PreviousPlaybackCompletedUtc == default ? 0 : (t.PlaybackStartedUtc - t.PreviousPlaybackCompletedUtc).TotalMilliseconds):F0} " +
+                  $"playMs={(t.PlaybackCompletedUtc - t.PlaybackStartedUtc).TotalMilliseconds:F0} " +
+                  $"prefetchHit={t.PrefetchHit} preview=\"{BoundedPreview(ready.Job.Text)}\"");
     }
 
     bool QueuedRemaining()
     {
-        lock (gate) return queue.Count > 0;
+        lock (gate) return queue.Count > 0 || readyPrefetch != null;
     }
 
     bool IsJobValid(SpeechJob job)
@@ -601,6 +646,7 @@ public sealed class MateSpeechOrchestrator
         public int ChunkIndex { get; }
         public string Text { get; }
         public long Generation { get; }
+        public SpeechTiming Timing { get; } = new SpeechTiming();
 
         public SpeechJob(Guid turnId, int chunkIndex, string text, long generation)
         {
@@ -609,5 +655,32 @@ public sealed class MateSpeechOrchestrator
             Text = text;
             Generation = generation;
         }
+    }
+
+    sealed class ReadySpeech
+    {
+        public SpeechJob Job { get; }
+        public MateTtsSynthesisResult Result { get; }
+        public string VoiceId { get; }
+        public SpeechTiming Timing => Job.Timing;
+
+        public ReadySpeech(SpeechJob job, MateTtsSynthesisResult result, string voiceId)
+        {
+            Job = job;
+            Result = result;
+            VoiceId = voiceId ?? "";
+        }
+    }
+
+    /// <summary>Bounded per-chunk timing record; previews deliberately stay out of this data.</summary>
+    public sealed class SpeechTiming
+    {
+        public DateTime QueuedUtc { get; internal set; }
+        public DateTime SynthesisStartedUtc { get; internal set; }
+        public DateTime SynthesisCompletedUtc { get; internal set; }
+        public DateTime PlaybackStartedUtc { get; internal set; }
+        public DateTime PlaybackCompletedUtc { get; internal set; }
+        public DateTime PreviousPlaybackCompletedUtc { get; internal set; }
+        public bool PrefetchHit { get; internal set; }
     }
 }

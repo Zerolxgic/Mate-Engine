@@ -9,9 +9,14 @@ using System.Text;
 public sealed class MateSentenceChunker
 {
     public const int DefaultMaxBufferChars = 480;
+    // The first release favors time-to-first-speech; later weak boundaries need
+    // more context so Kokoro has enough audio to hide one synthesis request.
+    public const int FirstChunkMinChars = 32;
+    public const int WeakBoundaryMinChars = 96;
 
     readonly StringBuilder buffer = new StringBuilder();
     readonly int maxBufferChars;
+    bool hasEmittedChunk;
 
     public MateSentenceChunker(int maxBufferChars = DefaultMaxBufferChars)
     {
@@ -42,12 +47,14 @@ public sealed class MateSentenceChunker
         buffer.Clear();
         if (!IsSpeakableChunk(rest)) return emitted;
         emitted.Add(rest);
+        hasEmittedChunk = true;
         return emitted;
     }
 
     public void Reset()
     {
         buffer.Clear();
+        hasEmittedChunk = false;
     }
 
     void EmitCompleted(List<string> emitted, bool flushAll)
@@ -55,7 +62,7 @@ public sealed class MateSentenceChunker
         while (true)
         {
             string s = buffer.ToString();
-            int cut = FindSentenceEnd(s, requireTrailingBoundary: !flushAll);
+            int cut = FindReleaseBoundary(s, !hasEmittedChunk, flushAll);
             if (cut < 0) break;
 
             string chunk = s.Substring(0, cut + 1).Trim();
@@ -65,7 +72,10 @@ public sealed class MateSentenceChunker
                 buffer.Remove(0, 1);
 
             if (IsSpeakableChunk(chunk))
+            {
                 emitted.Add(chunk);
+                hasEmittedChunk = true;
+            }
         }
     }
 
@@ -84,26 +94,35 @@ public sealed class MateSentenceChunker
                 buffer.Remove(0, 1);
 
             if (IsSpeakableChunk(chunk))
+            {
                 emitted.Add(chunk);
+                hasEmittedChunk = true;
+            }
             else if (buffer.Length == 0)
                 break;
         }
     }
 
-    static int FindSentenceEnd(string s, bool requireTrailingBoundary)
+    static int FindReleaseBoundary(string s, bool isFirstChunk, bool flushAll)
     {
         for (int i = 0; i < s.Length; i++)
         {
             char c = s[i];
-            if (c != '.' && c != '!' && c != '?') continue;
+            bool strong = c == '.' || c == '!' || c == '?';
+            bool weak = c == ',' || c == ';' || c == ':' || c == '—' || c == '–' || c == '-';
+            if (!strong && !weak) continue;
 
             // Avoid splitting common abbreviations / decimals: digit.digit
-            if (c == '.' && i > 0 && i + 1 < s.Length &&
+            if (strong && c == '.' && i > 0 && i + 1 < s.Length &&
                 char.IsDigit(s[i - 1]) && char.IsDigit(s[i + 1]))
                 continue;
 
+            int minimum = isFirstChunk ? FirstChunkMinChars : WeakBoundaryMinChars;
+            if (weak && i + 1 < minimum)
+                continue;
+
             if (i + 1 >= s.Length)
-                return requireTrailingBoundary ? -1 : i;
+                return flushAll ? i : -1;
 
             char next = s[i + 1];
             if (char.IsWhiteSpace(next) || next == '"' || next == '\'' || next == ')')
