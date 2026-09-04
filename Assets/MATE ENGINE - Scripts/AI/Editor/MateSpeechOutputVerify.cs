@@ -121,6 +121,15 @@ public static class MateSpeechOutputVerify
         };
     }
 
+    /// <summary>Batch-safe entrypoint for the existing Slice 8 deterministic verifier.</summary>
+    public static void RunFromCommandLine()
+    {
+        var result = RunAll();
+        if (result.Failed > 0)
+            throw new Exception($"Mate Speech Output FAILED {result.Failed}/{result.Total}: {result.ReportPath}");
+        Debug.Log($"{LogPrefix} PASS {result.Total}/{result.Total}: {result.ReportPath}");
+    }
+
     public struct VerifyResult
     {
         public int Total;

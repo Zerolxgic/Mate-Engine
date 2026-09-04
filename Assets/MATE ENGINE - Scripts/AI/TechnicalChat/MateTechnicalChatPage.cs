@@ -78,6 +78,12 @@ header .status { color:var(--muted); font-size:12px; margin-left:auto; }
     </label>
     <button type=""button"" id=""speechTest"">Test Voice</button>
   </div>
+  <div id=""voice"">
+    <label>Speech Input <input type=""checkbox"" id=""speechInputEnabled""/></label>
+    <span>ASR: <strong id=""asrProvider"">speaches</strong></span>
+    <span id=""asrStatus"">Configured</span>
+    <button type=""button"" id=""ptt"">Push-to-Talk</button>
+  </div>
   <div id=""composer"">
     <textarea id=""input"" placeholder=""Message Mate…  Enter send · Shift+Enter newline""></textarea>
     <button id=""cancel"" type=""button"" disabled>Cancel</button>
@@ -95,8 +101,13 @@ const speechProvider = document.getElementById('speechProvider');
 const speechStatus = document.getElementById('speechStatus');
 const speechVoice = document.getElementById('speechVoice');
 const speechTest = document.getElementById('speechTest');
+const speechInputEnabled = document.getElementById('speechInputEnabled');
+const asrProvider = document.getElementById('asrProvider');
+const asrStatus = document.getElementById('asrStatus');
+const ptt = document.getElementById('ptt');
 let hasRunning = false;
 let speechApplyBusy = false;
+let pttHeld = false;
 
 function applyTheme(t){
   if(!t) return;
@@ -294,6 +305,8 @@ input.addEventListener('keydown', e => {
 refresh().then(connectSse);
 refreshSpeech();
 setInterval(refreshSpeech, 4000);
+refreshSpeechInput();
+setInterval(refreshSpeechInput, 1500);
 
 async function refreshSpeech(){
   try {
@@ -356,6 +369,30 @@ speechVoice.onchange = () => {
 speechTest.onclick = async () => {
   try { await fetch('/api/speech/test', { method:'POST' }); } catch {}
 };
+
+async function refreshSpeechInput(){
+  try { const r = await fetch('/api/speech-input/state'); renderSpeechInput(await r.json()); }
+  catch { asrStatus.textContent = 'Unavailable'; }
+}
+function renderSpeechInput(s){
+  if(!s) return;
+  speechInputEnabled.checked = !!s.speechInputEnabled;
+  asrProvider.textContent = s.providerId || 'speaches';
+  asrStatus.textContent = (s.lifecycle || s.status || 'Unknown') + (s.lastError ? (' — ' + s.lastError) : '');
+  ptt.disabled = !s.speechInputEnabled || s.lifecycle === 'Transcribing' || s.lifecycle === 'Submitting';
+  ptt.textContent = s.lifecycle === 'Capturing' ? 'Recording… release to send' : 'Push-to-Talk';
+}
+async function speechInputPost(path, body){
+  try { const r = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body: body ? JSON.stringify(body) : undefined}); const j = await r.json(); if(j.speechInput) renderSpeechInput(j.speechInput); else await refreshSpeechInput(); }
+  catch { asrStatus.textContent = 'Unavailable'; }
+}
+speechInputEnabled.onchange = () => speechInputPost('/api/speech-input/config', {speechInputEnabled: !!speechInputEnabled.checked});
+ptt.addEventListener('pointerdown', e => { e.preventDefault(); if(pttHeld) return; pttHeld = true; speechInputPost('/api/speech-input/start'); });
+function releasePtt(cancel){ if(!pttHeld) return; pttHeld = false; speechInputPost(cancel ? '/api/speech-input/cancel' : '/api/speech-input/stop'); }
+ptt.addEventListener('pointerup', () => releasePtt(false));
+ptt.addEventListener('pointercancel', () => releasePtt(true));
+window.addEventListener('blur', () => releasePtt(true));
+window.addEventListener('beforeunload', () => releasePtt(true));
 </script>
 </body>
 </html>";

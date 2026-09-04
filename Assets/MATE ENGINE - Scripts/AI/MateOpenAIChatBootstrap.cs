@@ -112,6 +112,11 @@ public static class MateOpenAIChatBootstrap
         {
             Debug.LogWarning($"{LogPrefix} Speech service bootstrap skipped: {speechEx.Message}");
         }
+        try { MateSpeechInputService.Ensure(); }
+        catch (Exception speechInputEx)
+        {
+            Debug.LogWarning($"{LogPrefix} Speech-input service bootstrap skipped: {speechInputEx.Message}");
+        }
         Debug.Log($"{LogPrefix} OpenAI backend ACTIVE for ChatBot '{chatBot.gameObject.name}' (hierarchyActive={chatBot.gameObject.activeInHierarchy}). Target={config.ChatCompletionsUrl} model={config.model}");
         return true;
     }
@@ -188,4 +193,3 @@ public static class MateOpenAIChatBootstrap
         }
     }
 }
-

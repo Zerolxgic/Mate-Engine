@@ -104,6 +104,52 @@ public static class MateTechnicalChatController
     }
 
     public static MateSpeechOrchestrator Speech => MateSpeechService.Current;
+    public static MateSpeechInputOrchestrator SpeechInput => MateSpeechInputService.Current;
+
+    public static string BuildSpeechInputStateJson()
+    {
+        var input = SpeechInput;
+        var cfg = MateSpeechInputService.Instance?.Config ?? MateSpeechInputConfig.LoadOrCreateTemplate();
+        if (input == null)
+            return "{\"speechInputEnabled\":" + (cfg.speechInputEnabled ? "true" : "false") +
+                   ",\"providerId\":\"" + Escape(cfg.providerId) + "\",\"baseUrl\":\"" + Escape(cfg.baseUrl) +
+                   "\",\"modelId\":\"" + Escape(cfg.modelId) + "\",\"language\":\"" + Escape(cfg.language) +
+                   "\",\"maximumCaptureSeconds\":" + cfg.GetMaximumCaptureSeconds() + ",\"status\":\"Configured\",\"lifecycle\":\"Idle\",\"lastError\":\"\",\"device\":\"\"}";
+        return "{\"speechInputEnabled\":" + (cfg.speechInputEnabled ? "true" : "false") +
+               ",\"providerId\":\"" + Escape(cfg.providerId) + "\",\"baseUrl\":\"" + Escape(cfg.baseUrl) +
+               "\",\"modelId\":\"" + Escape(cfg.modelId) + "\",\"language\":\"" + Escape(cfg.language) +
+               "\",\"maximumCaptureSeconds\":" + cfg.GetMaximumCaptureSeconds() + ",\"status\":\"" + input.ConnectionStatus +
+               "\",\"lifecycle\":\"" + input.State + "\",\"lastError\":\"" + Escape(input.LastError) +
+               "\",\"device\":\"" + Escape(input.ActiveDeviceName) + "\"}";
+    }
+
+    public static bool TryApplySpeechInputConfig(string body, out string error)
+    {
+        error = null; var cfg = MateSpeechInputService.Instance?.Config ?? MateSpeechInputConfig.LoadOrCreateTemplate();
+        bool? enabled = ExtractJsonBool(body, "speechInputEnabled");
+        string baseUrl = ExtractJsonString(body, "baseUrl"); string model = ExtractJsonString(body, "modelId");
+        if (enabled.HasValue) cfg.speechInputEnabled = enabled.Value;
+        if (!string.IsNullOrWhiteSpace(baseUrl)) cfg.baseUrl = baseUrl.Trim();
+        if (!string.IsNullOrWhiteSpace(model)) cfg.modelId = model.Trim();
+        cfg.Save();
+        var input = SpeechInput;
+        if (input != null && enabled.HasValue) input.SetEnabled(enabled.Value);
+        return true;
+    }
+
+    public static bool StartPushToTalk(out string error)
+    {
+        var input = SpeechInput;
+        if (input == null) { error = "speech input service unavailable"; return false; }
+        return input.StartPushToTalk(out error);
+    }
+    public static bool StopPushToTalk(out string error)
+    {
+        var input = SpeechInput;
+        if (input == null) { error = "speech input service unavailable"; return false; }
+        return input.StopPushToTalk(out error);
+    }
+    public static void CancelPushToTalk() { SpeechInput?.Cancel("browser PTT cancelled"); }
 
     public static string BuildSpeechStateJson()
     {

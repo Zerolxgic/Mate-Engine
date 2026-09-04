@@ -403,7 +403,65 @@ public sealed class MateTechnicalChatHost : MonoBehaviour
             return;
         }
 
+        if (ctx.Request.HttpMethod == "GET" && path == "/api/speech-input/state")
+        {
+            HandleSpeechInputState(ctx);
+            return;
+        }
+
+        if (ctx.Request.HttpMethod == "POST" && path == "/api/speech-input/config")
+        {
+            string body = ReadBody(ctx.Request);
+            HandleSpeechInputAction(ctx, () =>
+            {
+                if (!MateTechnicalChatController.TryApplySpeechInputConfig(body, out string err))
+                    return "{\"ok\":false,\"error\":\"" + EscapeJson(err ?? "rejected") + "\"}";
+                return "{\"ok\":true,\"speechInput\":" + MateTechnicalChatController.BuildSpeechInputStateJson() + "}";
+            });
+            return;
+        }
+
+        if (ctx.Request.HttpMethod == "POST" && path == "/api/speech-input/start")
+        {
+            HandleSpeechInputAction(ctx, () =>
+            {
+                if (!MateTechnicalChatController.StartPushToTalk(out string err))
+                    return "{\"ok\":false,\"error\":\"" + EscapeJson(err ?? "rejected") + "\"}";
+                return "{\"ok\":true,\"speechInput\":" + MateTechnicalChatController.BuildSpeechInputStateJson() + "}";
+            });
+            return;
+        }
+
+        if (ctx.Request.HttpMethod == "POST" && (path == "/api/speech-input/stop" || path == "/api/speech-input/cancel"))
+        {
+            bool cancel = path.EndsWith("/cancel", StringComparison.Ordinal);
+            HandleSpeechInputAction(ctx, () =>
+            {
+                if (cancel) MateTechnicalChatController.CancelPushToTalk();
+                else if (!MateTechnicalChatController.StopPushToTalk(out string err))
+                    return "{\"ok\":false,\"error\":\"" + EscapeJson(err ?? "rejected") + "\"}";
+                return "{\"ok\":true,\"speechInput\":" + MateTechnicalChatController.BuildSpeechInputStateJson() + "}";
+            });
+            return;
+        }
+
         WriteText(ctx.Response, 404, "text/plain", "not found");
+    }
+
+    void HandleSpeechInputState(HttpListenerContext ctx)
+    {
+        HandleSpeechInputAction(ctx, () => MateTechnicalChatController.BuildSpeechInputStateJson(), envelope: false);
+    }
+
+    void HandleSpeechInputAction(HttpListenerContext ctx, Func<string> action, bool envelope = true)
+    {
+        var tcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        mainThread.Enqueue(() => { try { tcs.TrySetResult(action()); } catch (Exception ex) { tcs.TrySetException(ex); } });
+        bool done = false; try { done = tcs.Task.Wait(5000); } catch { }
+        if (!done || tcs.Task.IsFaulted) { WriteText(ctx.Response, 500, "application/json", "{\"ok\":false,\"error\":\"speech input failed\"}"); return; }
+        string result = tcs.Task.Result ?? "{\"ok\":false,\"error\":\"empty result\"}";
+        int code = envelope && result.Contains("\"ok\":false") ? 400 : 200;
+        WriteText(ctx.Response, code, "application/json; charset=utf-8", result);
     }
 
     void HandleSend(HttpListenerContext ctx)
